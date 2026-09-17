@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from data.broker_client import UnifiedBrokerClient
 from scripts.runtime_common import project_config, save_market_filters
@@ -23,8 +25,9 @@ def main():
     except ValueError:
         errors.append("PAPER_STARTING_CAPITAL must be a positive rupee amount")
 
-    if not os.getenv("UPSTOX_ANALYTICS_TOKEN") and not os.getenv("UPSTOX_ACCESS_TOKEN"):
-        errors.append("UPSTOX_ANALYTICS_TOKEN is missing")
+    # PAPER mode must use only the read-only Analytics Token.
+    if not os.getenv("UPSTOX_ANALYTICS_TOKEN"):
+        errors.append("UPSTOX_ANALYTICS_TOKEN is missing from project .env")
 
     tg = TelegramClient()
     if not tg.is_configured():

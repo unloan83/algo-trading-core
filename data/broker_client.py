@@ -10,8 +10,10 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 SUSPENDED_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/suspended-instrument.json.gz"
@@ -31,10 +33,9 @@ class UnifiedBrokerClient:
             raise RuntimeError("LIVE_TRADING_DISABLED_DURING_30_DAY_PAPER_GATE")
         self.paper_mode = True
         self.timeout = timeout
-        self.token = (
-            os.getenv("UPSTOX_ANALYTICS_TOKEN")
-            or os.getenv("UPSTOX_ACCESS_TOKEN")
-        )
+        # Mandatory for the 30-day PAPER phase: use the read-only
+        # Analytics Token only; never fall back to a trading OAuth token.
+        self.token = os.getenv("UPSTOX_ANALYTICS_TOKEN")
         self.session = requests.Session()
         self._instrument_records: Optional[List[Dict[str, Any]]] = None
         self._instrument_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -43,7 +44,7 @@ class UnifiedBrokerClient:
 
     def _headers(self) -> Dict[str, str]:
         if not self.token:
-            raise RuntimeError("UPSTOX_TOKEN_MISSING")
+            raise RuntimeError("UPSTOX_ANALYTICS_TOKEN_MISSING")
         return {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.token}",
@@ -184,27 +185,29 @@ class UnifiedBrokerClient:
         return self._candles_to_df(self._get_json(url))
 
     def get_ltp(self, symbol: str) -> Optional[float]:
+        """
+        Return only a genuine Upstox V3 LTP.
+
+        Never fall back to a historical close. Authentication/API failures
+        propagate so the paper engine fails closed rather than using stale
+        prices for entries, MTM, stops, or targets.
+        """
         key = self.resolve_instrument_key(symbol)
-        try:
-            payload = self._get_json(
-                f"{UPSTOX_BASE}/v3/market-quote/ltp",
-                params={"instrument_key": key},
-            )
-            data = payload.get("data") or {}
-            if data:
-                first = next(iter(data.values()))
-                price = first.get("last_price")
-                if price is not None:
-                    return float(price)
-        except Exception:
-            pass
-        try:
-            df = self.get_historical_data(symbol, days=1)
-            if not df.empty:
-                return float(df["close"].iloc[-1])
-        except Exception:
-            pass
-        return None
+        payload = self._get_json(
+            f"{UPSTOX_BASE}/v3/market-quote/ltp",
+            params={"instrument_key": key},
+        )
+        data = payload.get("data") or {}
+        if not data:
+            return None
+
+        first = next(iter(data.values()))
+        price = first.get("last_price")
+        if price is None:
+            return None
+
+        price = float(price)
+        return price if price > 0 else None
 
     def is_nse_trading_day(self, on_date: Optional[date] = None) -> bool:
         d = on_date or datetime.now(ZoneInfo("Asia/Kolkata")).date()
@@ -222,15 +225,23 @@ class UnifiedBrokerClient:
 
     def validate_readonly_access(self) -> Tuple[bool, str]:
         if not self.token:
-            return False, "UPSTOX_TOKEN_MISSING"
+            return False, "UPSTOX_ANALYTICS_TOKEN_MISSING"
         try:
             key = self.resolve_instrument_key("NIFTY 50")
+
+            # Strict current-quote check: no historical substitution.
             price = self.get_ltp("NIFTY 50")
             if not key or price is None or price <= 0:
-                return False, "UPSTOX_READONLY_PREFLIGHT_FAILED"
-            return True, "UPSTOX_READONLY_PREFLIGHT_OK"
+                return False, "UPSTOX_ANALYTICS_LTP_CHECK_FAILED"
+
+            # Independent historical-data check; both surfaces are required.
+            hist = self.get_historical_data("NIFTY 50", days=5)
+            if hist.empty or len(hist) < 2:
+                return False, "UPSTOX_ANALYTICS_HISTORY_CHECK_FAILED"
+
+            return True, "UPSTOX_ANALYTICS_READONLY_OK"
         except Exception as exc:
-            return False, f"UPSTOX_READONLY_PREFLIGHT_FAILED:{exc}"
+            return False, f"UPSTOX_ANALYTICS_PREFLIGHT_FAILED:{type(exc).__name__}:{exc}"
 
     def get_account_health(self) -> Tuple[bool, float, float, str]:
         """
