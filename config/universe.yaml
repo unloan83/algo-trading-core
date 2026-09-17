@@ -1,0 +1,28 @@
+universe:
+  etfs:
+    - NIFTYBEES
+    - JUNIORBEES
+    - BANKBEES
+    - MID150BEES
+  equities:
+    - RELIANCE
+    - TCS
+    - HDFCBANK
+    - ICICIBANK
+    - INFYS
+    - BHARTIARTL
+    - ITC
+    - SBIN
+    - LT
+    - HINDUNILVR
+    - AXISBANK
+    - KOTAKBANK
+    - MAHINDRAS
+    - MARUTI
+    - SUNPHARMA
+    - TATASTEEL
+    - TATAMOTORS
+    - POWERGRID
+    - NTPC
+    - TITAN
+  min_adtv_cr: 50

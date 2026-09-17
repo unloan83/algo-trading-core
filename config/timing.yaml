@@ -1,0 +1,14 @@
+timing:
+  eod_screener:
+    start_time: "15:45"
+    end_time: "16:05"
+    timezone: "Asia/Kolkata"
+  intraday_scan:
+    no_entry_start: "09:15"
+    no_entry_end: "09:25"
+    entry_window_start: "09:25"
+    entry_window_end: "14:15"
+    mandatory_square_off: "15:15"
+    max_orders_per_day: 6
+    gap_filter_pct: 1.5
+  telegram_approval_timeout_seconds: 120

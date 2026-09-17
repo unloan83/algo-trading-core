@@ -1,0 +1,17 @@
+capital_allocation:
+  trading_capital_pct_of_total: 100
+  fno_capital_cap_pct: 0
+
+risk_per_trade_pct: 0.5
+max_concurrent_open_risk_pct: 1.5
+daily_loss_circuit_pct: 1.5
+weekly_loss_circuit_pct: 3.0
+monthly_loss_circuit_pct: 4.5
+
+max_concurrent_positions: 4
+consecutive_loss_cooldown:
+  trigger_after_losses: 3
+  cooldown_hours: 24
+
+no_averaging_down: true
+default_action_on_timeout: "system_recommendation"

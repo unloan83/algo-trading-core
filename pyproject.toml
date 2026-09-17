@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "algo-trading-core"
+version = "0.1.0"
+description = "Institutional Automated Trading System core package"
+authors = [{name = "Antigravity Team"}]
+dependencies = [
+    "pydantic>=2.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "requests>=2.28.0",
+    "python-dotenv>=1.0.0",
+    "tenacity>=8.2.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0"
+]

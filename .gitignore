@@ -1,0 +1,18 @@
+# Secrets and local credentials (NEVER commit)
+.env
+*.env
+*.key
+*.pem
+
+# Local database and state files
+*.db
+*.sqlite
+*.sqlite3
+trading_system.db
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
