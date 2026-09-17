@@ -1,99 +1,322 @@
+import gzip
+import io
+import json
 import os
-import requests
-import datetime
-import pandas as pd
+from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+SUSPENDED_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/suspended-instrument.json.gz"
+UPSTOX_BASE = "https://api.upstox.com"
+
 
 class UnifiedBrokerClient:
     """
-    Unified interface for broker API interactions (Upstox / Fyers / Dhan / Market Data Feeds).
-    Provides real historical candle data, account health, LTP, and market halt filters.
-    """
-    def __init__(self, paper_mode: bool = True):
-        self.paper_mode = paper_mode
+    Read-only Upstox market-data client used by the 30-day PAPER phase.
 
-    def get_account_health(self) -> Tuple[bool, float, float, str]:
-        if self.paper_mode:
-            available_cash = 1000000.0
-            net_equity = 1000000.0
-            return True, available_cash, net_equity, "Paper trading mode OK"
-        
+    No order endpoint is implemented here.
+    UPSTOX_ANALYTICS_TOKEN is preferred because it is read-only and long-lived.
+    """
+
+    def __init__(self, paper_mode: bool = True, timeout: int = 15):
+        if not paper_mode:
+            raise RuntimeError("LIVE_TRADING_DISABLED_DURING_30_DAY_PAPER_GATE")
+        self.paper_mode = True
+        self.timeout = timeout
+        self.token = (
+            os.getenv("UPSTOX_ANALYTICS_TOKEN")
+            or os.getenv("UPSTOX_ACCESS_TOKEN")
+        )
+        self.session = requests.Session()
+        self._instrument_records: Optional[List[Dict[str, Any]]] = None
+        self._instrument_by_symbol: Dict[str, Dict[str, Any]] = {}
+        self.cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".cache"))
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _headers(self) -> Dict[str, str]:
+        if not self.token:
+            raise RuntimeError("UPSTOX_TOKEN_MISSING")
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.token}",
+        }
+
+    def _get_json(self, url: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        resp = self.session.get(
+            url,
+            headers=self._headers(),
+            params=params,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("status") not in (None, "success"):
+            raise RuntimeError(f"UPSTOX_API_ERROR: {payload}")
+        return payload
+
+    @staticmethod
+    def _decode_gzip_json(content: bytes):
         try:
-            api_key = os.getenv("BROKER_API_KEY") or os.getenv("UPSTOX_ACCESS_TOKEN")
-            if not api_key:
-                return False, 0.0, 0.0, "BROKER_HEALTH_FETCH_FAILED: API key missing"
-            
-            available_cash = 500000.0
-            holdings_val = 500000.0
-            net_equity = available_cash + holdings_val
-            return True, available_cash, net_equity, "Live account active and margins healthy"
-        except Exception as e:
-            return False, 0.0, 0.0, f"BROKER_HEALTH_FETCH_FAILED: {str(e)}"
+            return json.loads(gzip.decompress(content).decode("utf-8"))
+        except OSError:
+            return json.loads(content.decode("utf-8"))
+
+    def _load_instruments(self) -> None:
+        if self._instrument_records is not None:
+            return
+        cache_path = os.path.join(self.cache_dir, "upstox_nse_instruments.json")
+        today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        records = None
+        if os.path.exists(cache_path):
+            cache_date = datetime.fromtimestamp(
+                os.path.getmtime(cache_path), ZoneInfo("Asia/Kolkata")
+            ).date()
+            if cache_date == today_ist:
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        records = json.load(f)
+                except Exception:
+                    records = None
+        if records is None:
+            resp = self.session.get(NSE_INSTRUMENTS_URL, timeout=self.timeout)
+            resp.raise_for_status()
+            records = self._decode_gzip_json(resp.content)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(records, f)
+        self._instrument_records = records
+        self._instrument_by_symbol = {}
+        for row in records:
+            symbol = str(row.get("trading_symbol", "")).upper()
+            segment = row.get("segment")
+            instrument_type = row.get("instrument_type")
+            if symbol and segment == "NSE_EQ" and instrument_type == "EQ":
+                self._instrument_by_symbol[symbol] = row
+
+    def resolve_instrument(self, symbol: str) -> Dict[str, Any]:
+        normalized = symbol.strip().upper()
+        if normalized in {"NIFTY", "NIFTY50", "NIFTY 50"}:
+            return {
+                "instrument_key": "NSE_INDEX|Nifty 50",
+                "trading_symbol": "NIFTY",
+                "segment": "NSE_INDEX",
+                "instrument_type": "INDEX",
+                "isin": "",
+            }
+        if normalized in {"TATAMOTORS", "TMPV"}:
+            normalized = "TMPV"
+        self._load_instruments()
+        record = self._instrument_by_symbol.get(normalized)
+        if not record:
+            raise KeyError(f"UPSTOX_INSTRUMENT_NOT_FOUND:{symbol}")
+        return record
+
+    def resolve_instrument_key(self, symbol: str) -> str:
+        return str(self.resolve_instrument(symbol)["instrument_key"])
+
+    @staticmethod
+    def _candles_to_df(payload: Dict[str, Any]) -> pd.DataFrame:
+        candles = payload.get("data", {}).get("candles", []) or []
+        rows = []
+        for candle in candles:
+            if len(candle) < 6:
+                continue
+            ts = pd.to_datetime(candle[0])
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata").tz_localize(None)
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "open": float(candle[1]),
+                    "high": float(candle[2]),
+                    "low": float(candle[3]),
+                    "close": float(candle[4]),
+                    "volume": int(candle[5] or 0),
+                }
+            )
+        if not rows:
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+        return (
+            pd.DataFrame(rows)
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp")
+            .reset_index(drop=True)
+        )
+
+    def get_historical_data(self, symbol: str, days: int = 210) -> pd.DataFrame:
+        """Daily V3 candles. Upstox documents daily availability from Jan-2000."""
+        key = quote(self.resolve_instrument_key(symbol), safe="")
+        to_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        # Enough calendar buffer for requested trading sessions, kept well below V3's 10y/request cap.
+        from_date = to_date - timedelta(days=max(365, int(days * 2.0)))
+        url = (
+            f"{UPSTOX_BASE}/v3/historical-candle/{key}/days/1/"
+            f"{to_date.isoformat()}/{from_date.isoformat()}"
+        )
+        df = self._candles_to_df(self._get_json(url))
+        return df.tail(days).reset_index(drop=True)
+
+    def get_intraday_history(
+        self,
+        symbol: str,
+        interval_minutes: int = 5,
+        lookback_days: int = 7,
+    ) -> pd.DataFrame:
+        """Historical minute candles including prior sessions; suitable for intraday indicators."""
+        if not 1 <= interval_minutes <= 300:
+            raise ValueError("interval_minutes must be 1..300")
+        key = quote(self.resolve_instrument_key(symbol), safe="")
+        to_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        from_date = to_date - timedelta(days=max(2, lookback_days))
+        url = (
+            f"{UPSTOX_BASE}/v3/historical-candle/{key}/minutes/{interval_minutes}/"
+            f"{to_date.isoformat()}/{from_date.isoformat()}"
+        )
+        return self._candles_to_df(self._get_json(url))
 
     def get_ltp(self, symbol: str) -> Optional[float]:
-        df = self.get_historical_data(symbol, days=2)
-        if not df.empty and 'close' in df.columns:
-            return float(df['close'].iloc[-1])
-        return 100.0 if self.paper_mode else None
-
-    def get_trading_halts_and_corp_actions(self) -> Tuple[List[str], List[str]]:
-        halted = []
-        corp_actions = []
-        return halted, corp_actions
-
-    def get_historical_data(self, symbol: str, days: int = 5) -> pd.DataFrame:
-        """
-        Fetches historical daily candle data (Open, High, Low, Close, Volume) for Nifty 50 or Equities.
-        Returns a pandas.DataFrame with ['timestamp', 'open', 'high', 'low', 'close', 'volume'].
-        """
-        # Symbol normalization for NSE / Yahoo / Upstox
-        ticker_map = {
-            'NIFTY 50': '%5ENSEI',
-            'NIFTY50': '%5ENSEI',
-            'NIFTY': '%5ENSEI',
-            'NIFTY 100': '%5ECNXI100'
-        }
-        
-        ticker = ticker_map.get(symbol.upper(), f"{symbol.upper()}.NS")
-        
-        # Calculate date range
-        range_str = f"{max(days + 5, 5)}d"
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range={range_str}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        
+        key = self.resolve_instrument_key(symbol)
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'chart' in data and 'result' in data['chart'] and data['chart']['result']:
-                    result = data['chart']['result'][0]
-                    timestamps = result.get('timestamp', [])
-                    quote = result.get('indicators', {}).get('quote', [{}])[0]
-                    
-                    opens = quote.get('open', [])
-                    highs = quote.get('high', [])
-                    lows = quote.get('low', [])
-                    closes = quote.get('close', [])
-                    volumes = quote.get('volume', [])
-
-                    records = []
-                    for i in range(len(timestamps)):
-                        if i < len(opens) and opens[i] is not None and closes[i] is not None:
-                            dt_str = datetime.datetime.fromtimestamp(timestamps[i]).strftime('%Y-%m-%d')
-                            records.append({
-                                'timestamp': dt_str,
-                                'open': round(float(opens[i]), 2),
-                                'high': round(float(highs[i]), 2),
-                                'low': round(float(lows[i]), 2),
-                                'close': round(float(closes[i]), 2),
-                                'volume': int(volumes[i]) if (i < len(volumes) and volumes[i] is not None) else 0
-                            })
-
-                    df = pd.DataFrame(records)
-                    if not df.empty:
-                        return df.tail(days).reset_index(drop=True)
-        except Exception as e:
+            payload = self._get_json(
+                f"{UPSTOX_BASE}/v3/market-quote/ltp",
+                params={"instrument_key": key},
+            )
+            data = payload.get("data") or {}
+            if data:
+                first = next(iter(data.values()))
+                price = first.get("last_price")
+                if price is not None:
+                    return float(price)
+        except Exception:
             pass
+        try:
+            df = self.get_historical_data(symbol, days=1)
+            if not df.empty:
+                return float(df["close"].iloc[-1])
+        except Exception:
+            pass
+        return None
 
-        # Fallback empty structure
-        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    def is_nse_trading_day(self, on_date: Optional[date] = None) -> bool:
+        d = on_date or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        payload = self._get_json(
+            f"{UPSTOX_BASE}/v2/market/timings/{d.isoformat()}"
+        )
+        for row in payload.get("data", []) or []:
+            if row.get("exchange") == "NSE":
+                return True
+        return False
+
+    def get_market_holidays(self) -> List[Dict[str, Any]]:
+        payload = self._get_json(f"{UPSTOX_BASE}/v2/market/holidays")
+        return payload.get("data", []) or []
+
+    def validate_readonly_access(self) -> Tuple[bool, str]:
+        if not self.token:
+            return False, "UPSTOX_TOKEN_MISSING"
+        try:
+            key = self.resolve_instrument_key("NIFTY 50")
+            price = self.get_ltp("NIFTY 50")
+            if not key or price is None or price <= 0:
+                return False, "UPSTOX_READONLY_PREFLIGHT_FAILED"
+            return True, "UPSTOX_READONLY_PREFLIGHT_OK"
+        except Exception as exc:
+            return False, f"UPSTOX_READONLY_PREFLIGHT_FAILED:{exc}"
+
+    def get_account_health(self) -> Tuple[bool, float, float, str]:
+        """
+        PAPER-only health. Paper capital is deliberately independent of the live broker balance.
+        Runtime scripts recompute free cash/equity from the paper ledger.
+        """
+        ok, msg = self.validate_readonly_access()
+        if not ok:
+            return False, 0.0, 0.0, msg
+        raw = os.getenv("PAPER_STARTING_CAPITAL", "").strip()
+        try:
+            capital = float(raw)
+        except ValueError:
+            capital = 0.0
+        if capital <= 0:
+            return False, 0.0, 0.0, "PAPER_STARTING_CAPITAL_MISSING_OR_INVALID"
+        return True, capital, capital, "PAPER_ACCOUNT_AND_UPSTOX_DATA_OK"
+
+    def get_trading_halts_and_corp_actions(
+        self,
+        symbols: Optional[List[str]] = None,
+        corporate_action_window_days: int = 2,
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Fail-safe filters:
+        - suspended NSE symbols from Upstox's suspended instrument file
+        - near-term corporate actions from Upstox fundamentals API for the supplied universe
+        """
+        symbols = symbols or []
+        halted: List[str] = []
+        corp_actions: List[str] = []
+
+        try:
+            suspended_cache = os.path.join(self.cache_dir, "upstox_suspended.json")
+            today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            suspended = None
+            if os.path.exists(suspended_cache):
+                cache_date = datetime.fromtimestamp(
+                    os.path.getmtime(suspended_cache), ZoneInfo("Asia/Kolkata")
+                ).date()
+                if cache_date == today_ist:
+                    try:
+                        with open(suspended_cache, "r", encoding="utf-8") as f:
+                            suspended = json.load(f)
+                    except Exception:
+                        suspended = None
+            if suspended is None:
+                resp = self.session.get(SUSPENDED_INSTRUMENTS_URL, timeout=self.timeout)
+                resp.raise_for_status()
+                suspended = self._decode_gzip_json(resp.content)
+                with open(suspended_cache, "w", encoding="utf-8") as f:
+                    json.dump(suspended, f)
+            wanted = {s.upper() for s in symbols}
+            halted = sorted(
+                {
+                    str(r.get("trading_symbol", "")).upper()
+                    for r in suspended
+                    if str(r.get("trading_symbol", "")).upper() in wanted
+                }
+            )
+        except Exception:
+            # Do not turn a non-critical suspended-file outage into fake information.
+            halted = []
+
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        end = today + timedelta(days=corporate_action_window_days)
+        for symbol in symbols:
+            try:
+                record = self.resolve_instrument(symbol)
+                isin = record.get("isin")
+                if not isin:
+                    continue
+                payload = self._get_json(
+                    f"{UPSTOX_BASE}/v2/fundamentals/{quote(str(isin), safe='')}/corporate-actions"
+                )
+                for event in payload.get("data", []) or []:
+                    raw_date = event.get("expiry_date")
+                    if not raw_date:
+                        continue
+                    event_date = datetime.strptime(raw_date, "%d %b %Y").date()
+                    if today <= event_date <= end:
+                        corp_actions.append(symbol)
+                        break
+            except Exception:
+                # Corporate-action API failure is handled separately by preflight/logging;
+                # never fabricate an action.
+                continue
+
+        return sorted(set(halted)), sorted(set(corp_actions))

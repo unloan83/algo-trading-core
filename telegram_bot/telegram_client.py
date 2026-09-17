@@ -1,75 +1,89 @@
-import os
-import requests
 import logging
-from typing import Optional, Dict, Any, Tuple
+import os
+from typing import Optional, Tuple
+
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger("telegram_client")
 
+
 class TelegramClient:
-    """
-    Lightweight Telegram Bot API client using standard requests.
-    Supports TELEGRAM_BOT_TOKEN and TELEGRAM_TOKEN environment variable keys.
-    """
-    def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None):
+    """Single-user Telegram client using long polling and a mandatory user allowlist."""
+
+    def __init__(
+        self,
+        bot_token: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        allowed_user_id: Optional[str] = None,
+    ):
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+        self.chat_id = str(chat_id or os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "")
+        self.allowed_user_id = str(allowed_user_id or os.getenv("TELEGRAM_ALLOWED_USER_ID") or "")
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}" if self.bot_token else None
+        self._offset: Optional[int] = None
 
     def is_configured(self) -> bool:
-        return bool(self.bot_token and self.chat_id and self.bot_token != "YOUR_TELEGRAM_BOT_TOKEN")
+        return bool(
+            self.bot_token
+            and self.chat_id
+            and self.allowed_user_id
+            and self.bot_token != "YOUR_TELEGRAM_BOT_TOKEN"
+        )
 
-    def send_message(
-        self,
-        text: str,
-        inline_keyboard: Optional[list] = None
-    ) -> Tuple[bool, Optional[int], str]:
+    def send_message(self, text: str, inline_keyboard: Optional[list] = None) -> Tuple[bool, Optional[int], str]:
         if not self.is_configured():
-            msg = "TELEGRAM NOT CONFIGURED: Set TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in .env"
-            logger.warning(msg)
-            return False, None, msg
-
-        url = f"{self.base_url}/sendMessage"
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": "HTML"
-        }
-
+            return False, None, "TELEGRAM_NOT_CONFIGURED_OR_ALLOWLIST_MISSING"
+        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
         if inline_keyboard:
             payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
-
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
             data = resp.json()
             if data.get("ok"):
-                msg_id = data["result"]["message_id"]
-                return True, msg_id, "Message sent successfully"
-            else:
-                return False, None, f"Telegram API error: {data.get('description')}"
-        except Exception as e:
-            return False, None, f"HTTP Exception sending Telegram message: {str(e)}"
+                return True, data["result"]["message_id"], "Message sent successfully"
+            return False, None, f"Telegram API error: {data.get('description')}"
+        except Exception as exc:
+            return False, None, f"Telegram HTTP exception: {exc}"
 
-    def poll_callback_query(self, offset: Optional[int] = None, timeout: int = 2) -> Tuple[Optional[str], Optional[int]]:
+    def send_approval(self, text: str, _buttons=None):
+        keyboard = [[
+            {"text": "✅ APPROVE", "callback_data": "APPROVE"},
+            {"text": "⛔ SKIP", "callback_data": "SKIP"},
+            {"text": "⏸ HOLD", "callback_data": "HOLD"},
+        ]]
+        return self.send_message(text, keyboard)
+
+    def poll_callback_query(self, timeout: int = 2) -> Optional[str]:
         if not self.is_configured():
-            return None, offset
-
-        url = f"{self.base_url}/getUpdates"
+            return None
         params = {"timeout": timeout}
-        if offset:
-            params["offset"] = offset
-
+        if self._offset is not None:
+            params["offset"] = self._offset
         try:
-            resp = requests.get(url, params=params, timeout=timeout + 5)
+            resp = requests.get(
+                f"{self.base_url}/getUpdates",
+                params=params,
+                timeout=timeout + 5,
+            )
             data = resp.json()
-            if data.get("ok") and data.get("result"):
-                for update in data["result"]:
-                    new_offset = update["update_id"] + 1
-                    if "callback_query" in update:
-                        cb_data = update["callback_query"].get("data")
-                        return cb_data, new_offset
-                return None, data["result"][-1]["update_id"] + 1
+            if not data.get("ok"):
+                return None
+            for update in data.get("result", []):
+                self._offset = update["update_id"] + 1
+                cb = update.get("callback_query")
+                if not cb:
+                    continue
+                from_id = str((cb.get("from") or {}).get("id", ""))
+                if from_id != self.allowed_user_id:
+                    logger.warning("Ignored Telegram callback from unauthorized user id")
+                    continue
+                message_chat_id = str(((cb.get("message") or {}).get("chat") or {}).get("id", ""))
+                if message_chat_id and message_chat_id != self.chat_id:
+                    logger.warning("Ignored Telegram callback from unauthorized chat")
+                    continue
+                return str(cb.get("data") or "").upper()
         except Exception:
-            pass
-        return None, offset
+            return None
+        return None

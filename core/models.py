@@ -1,17 +1,20 @@
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
+
 
 class Side(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
+
 
 class RegimeType(str, Enum):
     TREND_UP = "TREND_UP"
     TREND_DOWN = "TREND_DOWN"
     RANGE = "RANGE"
     HIGH_RISK = "HIGH_RISK"
+
 
 class OrderStatus(str, Enum):
     CREATED = "CREATED"
@@ -25,6 +28,7 @@ class OrderStatus(str, Enum):
     EXIT_PENDING = "EXIT_PENDING"
     CLOSED = "CLOSED"
     UNKNOWN = "UNKNOWN"
+
 
 class Candle(BaseModel):
     timestamp: datetime
@@ -43,6 +47,7 @@ class Candle(BaseModel):
         if self.low > self.high:
             raise ValueError(f"Low price {self.low} greater than High price {self.high}")
         return self
+
 
 class Signal(BaseModel):
     symbol: str
@@ -71,18 +76,19 @@ class Signal(BaseModel):
         stop_dist_pct = abs(self.entry_price - self.stop_price) / self.entry_price * 100.0
         if stop_dist_pct < 0.2 or stop_dist_pct > 25.0:
             raise ValueError(f"Stop distance {stop_dist_pct:.2f}% outside sanity band [0.2%, 25.0%]")
-
         return self
+
 
 class RiskCheckResult(BaseModel):
     passed: bool
     reason_code: str
     computed_qty: int = 0
     rupee_risk: float = 0.0
-    equity_now: float  # Removed gt=0 constraint so non-positive/zero equity can be cleanly represented
+    equity_now: float
     daily_circuit_used_pct: float = 0.0
     weekly_circuit_used_pct: float = 0.0
     monthly_circuit_used_pct: float = 0.0
+
 
 class Order(BaseModel):
     order_id: str
@@ -98,6 +104,8 @@ class Order(BaseModel):
     filled_price: Optional[float] = None
     auto_executed_on_timeout: bool = False
     is_paper: bool = True
+    is_intraday: bool = False
+
 
 class Position(BaseModel):
     position_id: str
@@ -112,3 +120,4 @@ class Position(BaseModel):
     realized_pnl: float = 0.0
     opened_at: datetime
     is_paper: bool = True
+    is_intraday: bool = False
