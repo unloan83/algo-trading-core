@@ -225,23 +225,31 @@ class UnifiedBrokerClient:
 
     def validate_readonly_access(self) -> Tuple[bool, str]:
         if not self.token:
-            return False, "UPSTOX_ANALYTICS_TOKEN_MISSING"
+            return False, "UPSTOX_ANALYTICS_TOKEN_ERROR:MISSING"
+
         try:
             key = self.resolve_instrument_key("NIFTY 50")
 
-            # Strict current-quote check: no historical substitution.
             price = self.get_ltp("NIFTY 50")
             if not key or price is None or price <= 0:
-                return False, "UPSTOX_ANALYTICS_LTP_CHECK_FAILED"
+                return False, "UPSTOX_ANALYTICS_TOKEN_ERROR:LTP_UNAVAILABLE"
 
-            # Independent historical-data check; both surfaces are required.
             hist = self.get_historical_data("NIFTY 50", days=5)
             if hist.empty or len(hist) < 2:
-                return False, "UPSTOX_ANALYTICS_HISTORY_CHECK_FAILED"
+                return False, "UPSTOX_ANALYTICS_TOKEN_ERROR:HISTORICAL_DATA_UNAVAILABLE"
 
-            return True, "UPSTOX_ANALYTICS_READONLY_OK"
+            return True, "UPSTOX_ANALYTICS_TOKEN_VALID"
+
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "UNKNOWN"
+
+            if status in (401, 403):
+                return False, f"UPSTOX_ANALYTICS_TOKEN_ERROR:HTTP_{status}"
+
+            return False, f"UPSTOX_API_ERROR:HTTP_{status}"
+
         except Exception as exc:
-            return False, f"UPSTOX_ANALYTICS_PREFLIGHT_FAILED:{type(exc).__name__}:{exc}"
+            return False, f"UPSTOX_API_ERROR:{type(exc).__name__}:{exc}"
 
     def get_account_health(self) -> Tuple[bool, float, float, str]:
         """

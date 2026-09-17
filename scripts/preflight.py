@@ -60,10 +60,13 @@ def main():
 
     print("PREFLIGHT PASSED")
     print("mode=PAPER")
+    print(f"paper_starting_capital=₹{capital:,.2f}")
     print(f"universe={len(symbols)}")
-    print("upstox=read-only market data OK")
+    print("upstox_analytics_token=VALID")
+    print("upstox_live_ltp=OK")
+    print("upstox_historical_data=OK")
     print("telegram=allowlisted long-polling configured")
-    print("live_order_path=disabled")
+    print("live_order_path=DISABLED")
 
 
 if __name__ == "__main__":
