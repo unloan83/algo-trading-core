@@ -17,7 +17,14 @@ from core.screener import Screener
 from core.order_router import OrderRouter
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
-from scripts.runtime_common import build_risk_governor, now_ist_naive, project_config, load_market_filters
+from data.universe_selector import load_active_universe
+from scripts.runtime_common import (
+    build_risk_governor,
+    now_ist_naive,
+    project_config,
+    load_market_filters,
+    write_runtime_marker,
+)
 from telegram_bot.approval_gate import ApprovalGate
 from telegram_bot.telegram_client import TelegramClient
 
@@ -64,11 +71,12 @@ def main():
     if not ok:
         raise SystemExit(msg)
     if not broker.is_nse_trading_day(now.date()):
+        write_runtime_marker("intraday_scan", "SKIPPED", "NSE not trading today")
         return
 
     db = DatabaseManager()
     universe_cfg = project_config("universe.yaml")["universe"]
-    symbols = universe_cfg["equities"] + universe_cfg["etfs"]
+    symbols = load_active_universe(universe_cfg)
 
     open_positions = db.get_open_positions()
     for pos in open_positions:
@@ -96,7 +104,6 @@ def main():
         default_action_on_timeout=risk_cfg["default_action_on_timeout"],
     )
 
-    # 1) Execute approved EOD candidates at the next session's real observed price.
     for row in db.get_pending_signals():
         if any(p.symbol == row["symbol"] for p in open_positions):
             db.mark_pending_signal(row["pending_id"], "SKIPPED_DUPLICATE_POSITION")
@@ -125,13 +132,11 @@ def main():
         account = db.paper_account(capital, open_positions)
         log.info("Opened next-session PAPER position: %s", sig.symbol)
 
-    # 2) Existing intraday breakout logic, now wired to real 5-minute Upstox data.
     nifty = broker.get_intraday_history("NIFTY 50", interval_minutes=5, lookback_days=7)
     cutoff = now - timedelta(minutes=5)
     nifty = nifty[nifty["timestamp"] <= cutoff].reset_index(drop=True)
     if len(nifty) < 50:
-        log.warning("Insufficient 5-minute Nifty history: %d", len(nifty))
-        return
+        raise RuntimeError(f"INSUFFICIENT_5MIN_NIFTY_HISTORY:{len(nifty)}")
     regime, rationale = evaluate_regime(nifty)
     db.record_regime(regime.value, f"intraday:{rationale}")
 
@@ -151,7 +156,6 @@ def main():
         if any(p.symbol == sig.symbol for p in open_positions):
             continue
 
-        # Refresh account/risk state after every accepted position.
         account = db.paper_account(capital, open_positions)
         pnl = tracker.compute_mark_to_market_pnl(open_positions, as_of_date=now.date())
         risk = _risk_check(
@@ -178,6 +182,20 @@ def main():
             open_positions.append(pos)
             log.info("Opened intraday PAPER position: %s", sig.symbol)
 
+    write_runtime_marker(
+        "intraday_scan",
+        "SUCCESS",
+        f"universe={len(symbols)} data_ready={len(symbol_data)} signals={len(signals)}",
+    )
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        write_runtime_marker(
+            "intraday_scan",
+            "FAILED",
+            f"{type(exc).__name__}:{exc}",
+        )
+        raise
