@@ -9,7 +9,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from data.broker_client import UnifiedBrokerClient
-from scripts.runtime_common import project_config, save_market_filters
+from data.universe_selector import build_and_cache_dynamic_universe
+from scripts.runtime_common import (
+    project_config,
+    save_market_filters,
+    write_runtime_marker,
+)
 from telegram_bot.telegram_client import TelegramClient
 
 
@@ -23,16 +28,17 @@ def main():
         if capital <= 0:
             raise ValueError
     except ValueError:
+        capital = 0.0
         errors.append("PAPER_STARTING_CAPITAL must be a positive rupee amount")
 
-    # PAPER mode must use only the read-only Analytics Token.
     if not os.getenv("UPSTOX_ANALYTICS_TOKEN"):
         errors.append("UPSTOX_ANALYTICS_TOKEN is missing from project .env")
 
     tg = TelegramClient()
     if not tg.is_configured():
         errors.append(
-            "Telegram requires TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_ID"
+            "Telegram requires TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID "
+            "and TELEGRAM_ALLOWED_USER_ID"
         )
 
     broker = UnifiedBrokerClient(paper_mode=True)
@@ -40,13 +46,26 @@ def main():
     if not ok:
         errors.append(msg)
 
-    symbols_cfg = project_config("universe.yaml")["universe"]
-    symbols = symbols_cfg["equities"] + symbols_cfg["etfs"]
-    for symbol in symbols:
+    symbols = []
+    universe_meta = {}
+    if not errors:
         try:
-            broker.resolve_instrument_key(symbol)
+            universe_cfg = project_config("universe.yaml")["universe"]
+            symbols, universe_meta = build_and_cache_dynamic_universe(
+                broker,
+                universe_cfg,
+            )
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(
+                f"DYNAMIC_UNIVERSE_BUILD_FAILED:{type(exc).__name__}:{exc}"
+            )
+
+    if not errors:
+        for symbol in symbols:
+            try:
+                broker.resolve_instrument_key(symbol)
+            except Exception as exc:
+                errors.append(str(exc))
 
     if not errors:
         halted, corp = broker.get_trading_halts_and_corp_actions(symbols)
@@ -62,6 +81,12 @@ def main():
     print("mode=PAPER")
     print(f"paper_starting_capital=₹{capital:,.2f}")
     print(f"universe={len(symbols)}")
+    print(f"universe_mode={universe_meta.get('mode')}")
+    print(f"universe_source={universe_meta.get('source')}")
+    print(
+        "universe_eligible="
+        f"{universe_meta.get('eligible_count', len(symbols))}"
+    )
     print("upstox_analytics_token=VALID")
     print("upstox_live_ltp=OK")
     print("upstox_historical_data=OK")
@@ -70,4 +95,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        write_runtime_marker(
+            "preflight",
+            "FAILED",
+            f"{type(exc).__name__}:{exc}",
+        )
+        raise
+    else:
+        write_runtime_marker(
+            "preflight",
+            "SUCCESS",
+            "Dynamic Top-100 universe and market filters ready",
+        )
