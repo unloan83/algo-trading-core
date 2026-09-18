@@ -11,7 +11,14 @@ from core.regime_filter import evaluate_regime
 from core.screener import Screener
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
-from scripts.runtime_common import build_risk_governor, now_ist_naive, project_config, save_market_filters
+from data.universe_selector import load_active_universe
+from scripts.runtime_common import (
+    build_risk_governor,
+    now_ist_naive,
+    project_config,
+    save_market_filters,
+    write_runtime_marker,
+)
 from telegram_bot.approval_gate import ApprovalGate
 from telegram_bot.telegram_client import TelegramClient
 
@@ -29,10 +36,11 @@ def main():
         raise SystemExit(msg)
     if not broker.is_nse_trading_day(now.date()):
         log.info("NSE not trading today; EOD scan skipped.")
+        write_runtime_marker("eod_screener", "SKIPPED", "NSE not trading today")
         return
 
     universe_cfg = project_config("universe.yaml")["universe"]
-    symbols = universe_cfg["equities"] + universe_cfg["etfs"]
+    symbols = load_active_universe(universe_cfg)
 
     nifty_df = broker.get_historical_data("NIFTY 50", days=210)
     if len(nifty_df) < 200:
@@ -77,6 +85,7 @@ def main():
         default_action_on_timeout=risk_cfg["default_action_on_timeout"],
     )
 
+    approved_count = 0
     for sig in signals:
         risk = governor.validate_signal_against_invariants(
             signal=sig,
@@ -111,12 +120,30 @@ def main():
 
         if decision["action"] == "APPROVED":
             pending_id = db.save_pending_signal(sig)
+            approved_count += 1
             log.info(
                 "Approved EOD signal queued for next-session execution: %s (%s)",
                 sig.symbol,
                 pending_id,
             )
 
+    write_runtime_marker(
+        "eod_screener",
+        "SUCCESS",
+        (
+            f"universe={len(symbols)} data_ready={len(symbol_data)} "
+            f"signals={len(signals)} approved={approved_count}"
+        ),
+    )
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        write_runtime_marker(
+            "eod_screener",
+            "FAILED",
+            f"{type(exc).__name__}:{exc}",
+        )
+        raise
