@@ -1,28 +1,7 @@
 universe:
-  etfs:
-    - NIFTYBEES
-    - JUNIORBEES
-    - BANKBEES
-    - MID150BEES
-  equities:
-    - RELIANCE
-    - TCS
-    - HDFCBANK
-    - ICICIBANK
-    - INFY
-    - BHARTIARTL
-    - ITC
-    - SBIN
-    - LT
-    - HINDUNILVR
-    - AXISBANK
-    - KOTAKBANK
-    - M&M
-    - MARUTI
-    - SUNPHARMA
-    - TATASTEEL
-    - TMPV
-    - POWERGRID
-    - NTPC
-    - TITAN
+  mode: dynamic_nifty200_top100
+  source_url: "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
+  top_n: 100
+  adtv_lookback_days: 20
   min_adtv_cr: 50
+  constituent_cache_max_age_days: 30
