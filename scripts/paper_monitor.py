@@ -2,7 +2,7 @@
 import logging
 import os
 import sys
-from datetime import datetime, time
+from datetime import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -11,7 +11,11 @@ from core.order_router import OrderRouter
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
 from journal.trade_journal import ImmutableTradeJournal
-from scripts.runtime_common import now_ist_naive, project_config
+from scripts.runtime_common import (
+    now_ist_naive,
+    project_config,
+    write_runtime_marker,
+)
 from telegram_bot.notifications import NotificationService
 from telegram_bot.telegram_client import TelegramClient
 
@@ -25,20 +29,27 @@ def _parse_hhmm(v: str) -> time:
 
 
 def main():
-    db = DatabaseManager()
-    positions = db.get_open_positions()
-    if not positions:
-        return
-
     now = now_ist_naive()
     if not (time(9, 15) <= now.time() <= time(15, 30)):
         return
+
+    db = DatabaseManager()
+    positions = db.get_open_positions()
+
+    if not positions:
+        write_runtime_marker(
+            "paper_monitor",
+            "SUCCESS",
+            "No open positions; monitor heartbeat healthy",
+        )
+        return
+
     broker = UnifiedBrokerClient(paper_mode=True)
     ok, msg = broker.validate_readonly_access()
-    if not broker.is_nse_trading_day(now.date()):
-        return
     if not ok:
-        log.error(msg)
+        raise SystemExit(msg)
+    if not broker.is_nse_trading_day(now.date()):
+        write_runtime_marker("paper_monitor", "SKIPPED", "NSE not trading today")
         return
 
     router = OrderRouter(live_mode=False)
@@ -51,6 +62,7 @@ def main():
         project_config("timing.yaml")["timing"]["intraday_scan"]["mandatory_square_off"]
     )
 
+    closed_count = 0
     for pos in positions:
         ltp = broker.get_ltp(pos.symbol)
         if ltp is None:
@@ -90,7 +102,6 @@ def main():
             is_intraday=pos.is_intraday,
             slippage_already_applied=True,
         )
-        # Journal has authoritative net P&L; read it back before closing position row.
         with db.get_connection() as conn:
             row = conn.execute(
                 "SELECT net_pnl FROM trade_journal WHERE journal_id=?", (jid,)
@@ -101,8 +112,23 @@ def main():
             pos.symbol, pos.side.value, pos.qty, pos.entry_price,
             exit_price, 0.0, net_pnl, reason
         )
+        closed_count += 1
         log.info("Closed PAPER position %s: %s, net %.2f", pos.symbol, reason, net_pnl)
+
+    write_runtime_marker(
+        "paper_monitor",
+        "SUCCESS",
+        f"positions_checked={len(positions)} positions_closed={closed_count}",
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        write_runtime_marker(
+            "paper_monitor",
+            "FAILED",
+            f"{type(exc).__name__}:{exc}",
+        )
+        raise
