@@ -3,9 +3,19 @@ import os
 from typing import Optional, Tuple
 
 import requests
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+_project_root = Path(__file__).resolve().parents[1]
+for _env_path in [
+    Path("/home/user/projects/retained_credentials_and_data/Telegram_Credentials.env"),
+    Path("/home/user/projects/Telegram_Credentials.env"),
+    _project_root / ".env",
+]:
+    if _env_path.exists():
+        load_dotenv(_env_path, override=True)
+
 logger = logging.getLogger("telegram_client")
 
 
