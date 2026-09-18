@@ -11,7 +11,8 @@ class TestAlgoHealthAgent(unittest.TestCase):
         self.mock_broker = MagicMock()
         self.agent = AlgoHealthAgent(db=self.mock_db, broker=self.mock_broker)
 
-    def test_check_model_health(self):
+    @patch.object(AlgoHealthAgent, "_active_symbols", return_value=["INFY"])
+    def test_check_model_health(self, _mock_symbols):
         res = self.agent.check_model_health()
         self.assertEqual(res.domain, "MODEL_HEALTH")
         self.assertEqual(res.status, "OK")
@@ -61,7 +62,8 @@ class TestAlgoHealthAgent(unittest.TestCase):
         self.assertIn(res.status, ("OK", "WARNING", "BLOCKER"))
         self.assertIn("timeout_seconds", res.details)
 
-    def test_run_all_checks_returns_eight_domains(self):
+    @patch.object(AlgoHealthAgent, "_active_symbols", return_value=["INFY"])
+    def test_run_all_checks_returns_eight_domains(self, _mock_symbols):
         with patch.dict(os.environ, {"UPSTOX_ANALYTICS_TOKEN": "mock_token", "PAPER_STARTING_CAPITAL": "30000"}):
             self.mock_broker.validate_readonly_access.return_value = (True, "Token valid")
             self.mock_db.paper_account.return_value = (30000.0, 30000.0)
