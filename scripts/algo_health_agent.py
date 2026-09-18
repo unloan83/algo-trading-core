@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
-"""
-Independent Algo Models Health & Monitoring Agent.
-
-Performs standalone diagnostic checks across 6 core domains:
-1. Model Health (Breakout, Trend Pullback, EOD Screener, Regime Evaluator)
-2. System Blockers (Circuit Breakers, Loss Caps, Risk Limits)
-3. Data Integrity & Fake Data Detection (Stale candles, Zero Prices/Volume, Duplicates)
-4. Token & API Validity (Upstox Analytics Read-Only Token HTTP Ping)
-5. Logic & Database Integrity (SQLite Connection, Tables, Pending Backlog)
-6. Action Task Decision Gate (ApprovalGate & Callback Responder Readiness)
-
-Supports 3 execution modes:
-- --mode morning : Morning pre-market health & readiness report (08:45 IST)
-- --mode eod     : End-of-Day post-market summary of work done & PnL (16:00 IST)
-- --mode check   : Diagnostic check with instant real-time Telegram alert on issues
-"""
 
 import argparse
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import time, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
 for env_path in [
     Path("/home/user/projects/retained_credentials_and_data/Telegram_Credentials.env"),
     Path("/home/user/projects/Telegram_Credentials.env"),
@@ -40,18 +26,23 @@ for env_path in [
 from core.circuit_tracker import CircuitTracker
 from core.entry_models.breakout import evaluate_breakout
 from core.entry_models.trend_pullback import evaluate_trend_pullback
-from core.regime_filter import evaluate_regime
+from core.paper_engine import paper_starting_capital
 from core.screener import Screener
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
 from journal.analytics import AnalyticsEngine
-from scripts.runtime_common import build_risk_governor, load_market_filters, now_ist_naive, project_config
+from scripts.runtime_common import (
+    build_risk_governor,
+    load_market_filters,
+    now_ist_naive,
+    project_config,
+)
 from telegram_bot.approval_gate import ApprovalGate
 from telegram_bot.telegram_client import TelegramClient
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("algo_health_agent")
 
@@ -59,278 +50,580 @@ log = logging.getLogger("algo_health_agent")
 @dataclass
 class HealthCheckResult:
     domain: str
-    status: str  # "OK", "WARNING", "BLOCKER"
+    status: str
     message: str
     details: Dict = field(default_factory=dict)
 
 
 class AlgoHealthAgent:
-    """Independent health monitoring daemon and reporter."""
 
-    def __init__(self, db: Optional[DatabaseManager] = None, broker: Optional[UnifiedBrokerClient] = None):
+    def __init__(
+        self,
+        db: Optional[DatabaseManager] = None,
+        broker: Optional[UnifiedBrokerClient] = None,
+    ):
         self.db = db or DatabaseManager()
         self.broker = broker or UnifiedBrokerClient(paper_mode=True)
         self.telegram = TelegramClient()
         self.governor = build_risk_governor()
 
-    # ------------------------------------------------------------------
-    # Domain 1: Model Health
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------
+    # 1. MODEL HEALTH
+    # ---------------------------------------------------------
     def check_model_health(self) -> HealthCheckResult:
-        """Verifies entry models and regime evaluator execute cleanly."""
         try:
-            universe_cfg = project_config("universe.yaml")["universe"]
-            symbols = universe_cfg["equities"] + universe_cfg["etfs"]
+            universe = project_config("universe.yaml")["universe"]
+            symbols = universe["equities"] + universe["etfs"]
 
-            # Test screener initialization
-            screener = Screener(symbols)
+            Screener(symbols)
 
             return HealthCheckResult(
-                domain="MODEL_HEALTH",
-                status="OK",
-                message="All entry models and screener initialized successfully",
-                details={
-                    "breakout_model": evaluate_breakout.__name__,
-                    "pullback_model": evaluate_trend_pullback.__name__,
-                    "screener_symbols_count": len(symbols),
-                }
+                "MODEL_HEALTH",
+                "OK",
+                "Breakout, trend-pullback and screener modules loaded",
+                {
+                    "breakout": evaluate_breakout.__name__,
+                    "trend_pullback": evaluate_trend_pullback.__name__,
+                    "configured_symbols": len(symbols),
+                },
             )
+
         except Exception as exc:
-            log.error("Model health check exception: %s", exc, exc_info=True)
             return HealthCheckResult(
-                domain="MODEL_HEALTH",
-                status="BLOCKER",
-                message=f"Model initialization error ({type(exc).__name__}): {exc}"
+                "MODEL_HEALTH",
+                "BLOCKER",
+                f"Model initialization failed: {type(exc).__name__}: {exc}",
             )
 
-    # ------------------------------------------------------------------
-    # Domain 2: System Blockers & Circuit Breakers
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------
+    # 2. RISK / CIRCUIT HEALTH
+    # Uses same limits as real RiskGovernor
+    # ---------------------------------------------------------
     def check_system_blockers(self) -> HealthCheckResult:
-        """Checks circuit breakers, max daily loss, and consecutive loss caps."""
         try:
-            tracker = CircuitTracker(self.db)
             now = now_ist_naive()
+
+            tracker = CircuitTracker(self.db)
             tracker.check_and_update_rollover_state(now)
-            circuit_state = self.db.get_latest_circuit_state()
 
-            consecutive_losses = circuit_state.get("consecutive_losses", 0)
-            risk_cfg = project_config("risk_limits.yaml")
-            max_consec = int(risk_cfg.get("max_consecutive_losses_before_circuit_break", 3))
+            positions = self.db.get_open_positions()
 
-            open_positions = self.db.get_open_positions()
-            pnl_daily, pnl_weekly, pnl_monthly = tracker.compute_mark_to_market_pnl(
-                open_positions, as_of_date=now.date()
+            capital = paper_starting_capital()
+            _, equity = self.db.paper_account(capital, positions)
+
+            if equity <= 0:
+                return HealthCheckResult(
+                    "SYSTEM_BLOCKERS",
+                    "BLOCKER",
+                    "Paper account equity is zero or negative",
+                )
+
+            daily, weekly, monthly = tracker.compute_mark_to_market_pnl(
+                positions,
+                as_of_date=now.date(),
             )
 
-            max_daily_loss = float(risk_cfg.get("max_daily_loss_rupees", 1000.0))
+            state = self.db.get_latest_circuit_state()
+            consecutive_losses = int(state.get("consecutive_losses", 0))
+            last_loss_time = state.get("last_loss_time")
+
+            cfg = project_config("risk_limits.yaml")
+            cooldown_cfg = cfg["consecutive_loss_cooldown"]
 
             blockers = []
-            if consecutive_losses >= max_consec:
-                blockers.append(f"Circuit breaker active: {consecutive_losses}/{max_consec} consecutive losses")
 
-            if pnl_daily <= -abs(max_daily_loss):
-                blockers.append(f"Max daily loss breach: PnL = ₹{pnl_daily:,.2f} (Limit: -₹{max_daily_loss:,.2f})")
+            daily_loss_pct = abs(min(daily, 0.0)) / equity * 100.0
+            weekly_loss_pct = abs(min(weekly, 0.0)) / equity * 100.0
+            monthly_loss_pct = abs(min(monthly, 0.0)) / equity * 100.0
+
+            if daily_loss_pct >= self.governor.daily_circuit_pct:
+                blockers.append(
+                    f"Daily circuit breached: {daily_loss_pct:.2f}%"
+                )
+
+            if weekly_loss_pct >= self.governor.weekly_circuit_pct:
+                blockers.append(
+                    f"Weekly circuit breached: {weekly_loss_pct:.2f}%"
+                )
+
+            if monthly_loss_pct >= self.governor.monthly_circuit_pct:
+                blockers.append(
+                    f"Monthly circuit breached: {monthly_loss_pct:.2f}%"
+                )
+
+            trigger = int(cooldown_cfg["trigger_after_losses"])
+            cooldown_hours = int(cooldown_cfg["cooldown_hours"])
+
+            if consecutive_losses >= trigger and last_loss_time:
+                cooldown_end = last_loss_time + timedelta(hours=cooldown_hours)
+                if now < cooldown_end:
+                    blockers.append(
+                        f"Consecutive-loss cooldown active: "
+                        f"{consecutive_losses} losses"
+                    )
 
             if blockers:
                 return HealthCheckResult(
-                    domain="SYSTEM_BLOCKERS",
-                    status="BLOCKER",
-                    message="Active risk blockers detected: " + "; ".join(blockers),
-                    details={
-                        "consecutive_losses": consecutive_losses,
-                        "daily_pnl": pnl_daily,
-                        "blockers": blockers
-                    }
+                    "SYSTEM_BLOCKERS",
+                    "BLOCKER",
+                    "; ".join(blockers),
+                    {
+                        "daily_pnl": daily,
+                        "weekly_pnl": weekly,
+                        "monthly_pnl": monthly,
+                        "equity": equity,
+                    },
                 )
 
             return HealthCheckResult(
-                domain="SYSTEM_BLOCKERS",
-                status="OK",
-                message="No active system blockers or circuit breaker limits tripped",
-                details={
-                    "consecutive_losses": consecutive_losses,
-                    "daily_pnl": pnl_daily,
-                    "open_positions": len(open_positions)
-                }
-            )
-        except Exception as exc:
-            log.error("System blockers check exception: %s", exc, exc_info=True)
-            return HealthCheckResult(
-                domain="SYSTEM_BLOCKERS",
-                status="BLOCKER",
-                message=f"Blocker check exception ({type(exc).__name__}): {exc}"
+                "SYSTEM_BLOCKERS",
+                "OK",
+                "Risk governor circuits clear",
+                {
+                    "daily_pnl": daily,
+                    "weekly_pnl": weekly,
+                    "monthly_pnl": monthly,
+                    "equity": equity,
+                    "open_positions": len(positions),
+                },
             )
 
-    # ------------------------------------------------------------------
-    # Domain 3: Data Integrity & Fake Data Detection
-    # ------------------------------------------------------------------
+        except Exception as exc:
+            return HealthCheckResult(
+                "SYSTEM_BLOCKERS",
+                "BLOCKER",
+                f"Risk-state check failed: {type(exc).__name__}: {exc}",
+            )
+
+    # ---------------------------------------------------------
+    # 3. DATA + FAKE DATA + INSTRUMENT ID HEALTH
+    # ---------------------------------------------------------
     def check_fake_data_and_quality(self) -> HealthCheckResult:
-        """Inspects market data feed for stale timestamps, zero/negative prices, or missing candles."""
         try:
             now = now_ist_naive()
-            # Fetch Nifty 50 5-minute candles to verify live feed
-            df = self.broker.get_intraday_history("NIFTY 50", interval_minutes=5, lookback_days=3)
+
+            df = self.broker.get_intraday_history(
+                "NIFTY 50",
+                interval_minutes=5,
+                lookback_days=3,
+            )
 
             if df.empty:
                 return HealthCheckResult(
-                    domain="DATA_INTEGRITY",
-                    status="BLOCKER",
-                    message="Nifty 50 historical candle feed returned EMPTY dataframe"
+                    "DATA_INTEGRITY",
+                    "BLOCKER",
+                    "Upstox returned no NIFTY 50 candles",
                 )
 
-            # Check required columns
-            required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
-            if not required_cols.issubset(df.columns):
+            required = {
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            }
+
+            if not required.issubset(df.columns):
                 return HealthCheckResult(
-                    domain="DATA_INTEGRITY",
-                    status="BLOCKER",
-                    message=f"Candle schema missing required columns: {required_cols - set(df.columns)}"
+                    "DATA_INTEGRITY",
+                    "BLOCKER",
+                    f"Missing candle fields: {required - set(df.columns)}",
                 )
 
-            # Check for zero or negative prices
-            invalid_prices = df[(df["close"] <= 0) | (df["high"] <= 0) | (df["low"] <= 0) | (df["open"] <= 0)]
-            if not invalid_prices.empty:
+            invalid = df[
+                (df["open"] <= 0)
+                | (df["high"] <= 0)
+                | (df["low"] <= 0)
+                | (df["close"] <= 0)
+            ]
+
+            if not invalid.empty:
                 return HealthCheckResult(
-                    domain="DATA_INTEGRITY",
-                    status="BLOCKER",
-                    message=f"Fake/Corrupt data detected: {len(invalid_prices)} candles with non-positive prices"
+                    "DATA_INTEGRITY",
+                    "BLOCKER",
+                    f"{len(invalid)} candles contain non-positive prices",
                 )
 
-            # Check for duplicate timestamps
-            duplicates = df[df.duplicated(subset=["timestamp"], keep=False)]
-            if not duplicates.empty:
+            duplicates = int(df["timestamp"].duplicated().sum())
+
+            if duplicates:
                 return HealthCheckResult(
-                    domain="DATA_INTEGRITY",
-                    status="WARNING",
-                    message=f"Data quality warning: {len(duplicates)} duplicate timestamp candles found"
+                    "DATA_INTEGRITY",
+                    "WARNING",
+                    f"{duplicates} duplicate candle timestamps detected",
                 )
 
             latest_ts = df["timestamp"].max()
+
+            # During active market hours the feed must remain fresh.
+            if (
+                now.weekday() < 5
+                and time(9, 25) <= now.time() <= time(15, 30)
+            ):
+                age_minutes = (now - latest_ts).total_seconds() / 60.0
+
+                if age_minutes > 15:
+                    return HealthCheckResult(
+                        "DATA_INTEGRITY",
+                        "BLOCKER",
+                        f"Market feed stale by {age_minutes:.1f} minutes",
+                    )
+
+            # Validate every configured instrument ID.
+            universe = project_config("universe.yaml")["universe"]
+            symbols = universe["equities"] + universe["etfs"]
+
+            bad_symbols = []
+            instrument_keys = set()
+
+            for symbol in symbols:
+                try:
+                    key = self.broker.resolve_instrument_key(symbol)
+
+                    if not key:
+                        bad_symbols.append(symbol)
+                        continue
+
+                    if key in instrument_keys:
+                        return HealthCheckResult(
+                            "DATA_INTEGRITY",
+                            "BLOCKER",
+                            f"Duplicate instrument key detected: {key}",
+                        )
+
+                    instrument_keys.add(key)
+
+                except Exception:
+                    bad_symbols.append(symbol)
+
+            if bad_symbols:
+                return HealthCheckResult(
+                    "DATA_INTEGRITY",
+                    "BLOCKER",
+                    "Invalid/unresolved instrument IDs: "
+                    + ", ".join(bad_symbols),
+                )
+
             return HealthCheckResult(
-                domain="DATA_INTEGRITY",
-                status="OK",
-                message="Market data integrity verified (no fake prices or schema errors)",
-                details={
-                    "candles_count": len(df),
-                    "latest_candle_timestamp": str(latest_ts)
-                }
-            )
-        except Exception as exc:
-            log.error("Data integrity check exception: %s", exc, exc_info=True)
-            return HealthCheckResult(
-                domain="DATA_INTEGRITY",
-                status="BLOCKER",
-                message=f"Data integrity exception ({type(exc).__name__}): {exc}"
+                "DATA_INTEGRITY",
+                "OK",
+                "Upstox data, timestamps and instrument IDs verified",
+                {
+                    "latest_candle": str(latest_ts),
+                    "candles": len(df),
+                    "instrument_ids_checked": len(symbols),
+                },
             )
 
-    # ------------------------------------------------------------------
-    # Domain 4: Token & API Validity Check
-    # ------------------------------------------------------------------
+        except Exception as exc:
+            return HealthCheckResult(
+                "DATA_INTEGRITY",
+                "BLOCKER",
+                f"Data integrity check failed: {type(exc).__name__}: {exc}",
+            )
+
+    # ---------------------------------------------------------
+    # 4. UPSTOX TOKEN / API
+    # ---------------------------------------------------------
     def check_token_blockages(self) -> HealthCheckResult:
-        """Pings Upstox API using UPSTOX_ANALYTICS_TOKEN to verify token validity."""
         try:
-            token = os.getenv("UPSTOX_ANALYTICS_TOKEN")
-            if not token:
+            if not os.getenv("UPSTOX_ANALYTICS_TOKEN"):
                 return HealthCheckResult(
-                    domain="TOKEN_VALIDITY",
-                    status="BLOCKER",
-                    message="UPSTOX_ANALYTICS_TOKEN is missing from environment"
+                    "TOKEN_VALIDITY",
+                    "BLOCKER",
+                    "UPSTOX_ANALYTICS_TOKEN missing",
                 )
 
             ok, msg = self.broker.validate_readonly_access()
+
             if not ok:
                 return HealthCheckResult(
-                    domain="TOKEN_VALIDITY",
-                    status="BLOCKER",
-                    message=f"Upstox Analytics Token validation failed: {msg}"
+                    "TOKEN_VALIDITY",
+                    "BLOCKER",
+                    msg,
                 )
 
             return HealthCheckResult(
-                domain="TOKEN_VALIDITY",
-                status="OK",
-                message="Upstox Analytics Read-Only Token is ACTIVE and VALID",
-                details={"token_status": "VALID_READONLY"}
-            )
-        except Exception as exc:
-            log.error("Token blockage check exception: %s", exc, exc_info=True)
-            return HealthCheckResult(
-                domain="TOKEN_VALIDITY",
-                status="BLOCKER",
-                message=f"Token check exception ({type(exc).__name__}): {exc}"
+                "TOKEN_VALIDITY",
+                "OK",
+                "Upstox read-only analytics access verified",
             )
 
-    # ------------------------------------------------------------------
-    # Domain 5: Logic & Database Integrity
-    # ------------------------------------------------------------------
+        except Exception as exc:
+            return HealthCheckResult(
+                "TOKEN_VALIDITY",
+                "BLOCKER",
+                f"Upstox validation failed: {type(exc).__name__}: {exc}",
+            )
+
+    # ---------------------------------------------------------
+    # 5. DATABASE
+    # ---------------------------------------------------------
     def check_logic_and_database(self) -> HealthCheckResult:
-        """Checks SQLite database integrity, table status, and pending signal backlog."""
         try:
+            with self.db.get_connection() as conn:
+                row = conn.execute("PRAGMA integrity_check").fetchone()
+                integrity = str(row[0]).lower()
+
+            if integrity != "ok":
+                return HealthCheckResult(
+                    "LOGIC_DB",
+                    "BLOCKER",
+                    f"SQLite integrity_check failed: {integrity}",
+                )
+
             pending = self.db.get_pending_signals()
-            open_pos = self.db.get_open_positions()
+            open_positions = self.db.get_open_positions()
 
             return HealthCheckResult(
-                domain="LOGIC_DB",
-                status="OK",
-                message="Database connection and table schemas operational",
-                details={
-                    "pending_signals_count": len(pending),
-                    "open_positions_count": len(open_pos)
-                }
+                "LOGIC_DB",
+                "OK",
+                "SQLite database integrity verified",
+                {
+                    "pending_signals": len(pending),
+                    "open_positions": len(open_positions),
+                },
             )
+
         except Exception as exc:
-            log.error("Database integrity check exception: %s", exc, exc_info=True)
             return HealthCheckResult(
-                domain="LOGIC_DB",
-                status="BLOCKER",
-                message=f"Database integrity exception ({type(exc).__name__}): {exc}"
+                "LOGIC_DB",
+                "BLOCKER",
+                f"Database check failed: {type(exc).__name__}: {exc}",
             )
 
-    # ------------------------------------------------------------------
-    # Domain 6: Action Task Decision Gate Verification
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------
+    # 6. TELEGRAM / APPROVAL GATE
+    # ---------------------------------------------------------
     def check_action_decision_gate(self) -> HealthCheckResult:
-        """Verifies ApprovalGate configuration & callback responder without modifying any code."""
         try:
             risk_cfg = project_config("risk_limits.yaml")
             timing_cfg = project_config("timing.yaml")["timing"]
 
             approval = ApprovalGate(
-                timeout_seconds=int(timing_cfg["telegram_approval_timeout_seconds"]),
-                default_action_on_timeout=risk_cfg["default_action_on_timeout"],
+                timeout_seconds=int(
+                    timing_cfg["telegram_approval_timeout_seconds"]
+                ),
+                default_action_on_timeout=risk_cfg[
+                    "default_action_on_timeout"
+                ],
             )
 
-            is_configured = self.telegram.is_configured()
-            status_str = "OK" if is_configured else "WARNING"
-            msg = (
-                "ApprovalGate decision flow ready with Telegram client configured"
-                if is_configured
-                else "ApprovalGate decision flow ready (Telegram client pending configuration)"
-            )
+            if not self.telegram.is_configured():
+                return HealthCheckResult(
+                    "ACTION_DECISION_GATE",
+                    "BLOCKER",
+                    "Telegram credentials/allowlist not configured",
+                )
 
             return HealthCheckResult(
-                domain="ACTION_DECISION_GATE",
-                status=status_str,
-                message=msg,
-                details={
+                "ACTION_DECISION_GATE",
+                "OK",
+                "Telegram approval gate configured",
+                {
                     "timeout_seconds": approval.timeout_seconds,
-                    "default_action_on_timeout": approval.default_action_on_timeout,
-                    "telegram_configured": is_configured,
-                }
-            )
-        except Exception as exc:
-            log.error("Action decision gate check exception: %s", exc, exc_info=True)
-            return HealthCheckResult(
-                domain="ACTION_DECISION_GATE",
-                status="BLOCKER",
-                message=f"ApprovalGate verification exception ({type(exc).__name__}): {exc}"
+                    "default_action": approval.default_action_on_timeout,
+                },
             )
 
-    # ------------------------------------------------------------------
-    # Master Diagnostic Runner
-    # ------------------------------------------------------------------
+        except Exception as exc:
+            return HealthCheckResult(
+                "ACTION_DECISION_GATE",
+                "BLOCKER",
+                f"ApprovalGate check failed: {type(exc).__name__}: {exc}",
+            )
+
+    # ---------------------------------------------------------
+    # 7. ACTUAL RUNTIME ACTIVITY
+    # Proves that preflight / intraday / EOD actually ran.
+    # ---------------------------------------------------------
+    def check_runtime_activity(self) -> HealthCheckResult:
+        try:
+            now = now_ist_naive()
+
+            # Morning preflight must have produced today's filter cache.
+            try:
+                load_market_filters()
+                preflight_ok = True
+            except Exception as exc:
+                preflight_ok = False
+                preflight_error = str(exc)
+
+            with self.db.get_connection() as conn:
+                date_str = now.date().isoformat()
+
+                intraday_events = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM regime_log
+                    WHERE substr(timestamp,1,10)=?
+                      AND rationale LIKE 'intraday:%'
+                    """,
+                    (date_str,),
+                ).fetchone()[0]
+
+                eod_events = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM regime_log
+                    WHERE substr(timestamp,1,10)=?
+                      AND rationale NOT LIKE 'intraday:%'
+                    """,
+                    (date_str,),
+                ).fetchone()[0]
+
+            trading_day = self.broker.is_nse_trading_day(now.date())
+
+            blockers = []
+
+            if now.time() >= time(8, 50) and not preflight_ok:
+                blockers.append(
+                    f"Morning preflight evidence missing: {preflight_error}"
+                )
+
+            if trading_day:
+                if now.time() >= time(9, 45) and intraday_events == 0:
+                    blockers.append(
+                        "No intraday scanner execution evidence today"
+                    )
+
+                if now.time() >= time(16, 5) and eod_events == 0:
+                    blockers.append(
+                        "No EOD screener execution evidence today"
+                    )
+
+                if now.time() >= time(15, 20):
+                    intraday_open = [
+                        p.symbol
+                        for p in self.db.get_open_positions()
+                        if p.is_intraday
+                    ]
+
+                    if intraday_open:
+                        blockers.append(
+                            "Intraday positions remain open after mandatory "
+                            "square-off: "
+                            + ", ".join(intraday_open)
+                        )
+
+            if blockers:
+                return HealthCheckResult(
+                    "RUNTIME_ACTIVITY",
+                    "BLOCKER",
+                    "; ".join(blockers),
+                    {
+                        "intraday_regime_events": intraday_events,
+                        "eod_regime_events": eod_events,
+                    },
+                )
+
+            return HealthCheckResult(
+                "RUNTIME_ACTIVITY",
+                "OK",
+                "Expected runtime activity present",
+                {
+                    "preflight_cache": preflight_ok,
+                    "intraday_regime_events": intraday_events,
+                    "eod_regime_events": eod_events,
+                },
+            )
+
+        except Exception as exc:
+            return HealthCheckResult(
+                "RUNTIME_ACTIVITY",
+                "BLOCKER",
+                f"Runtime activity check failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    # ---------------------------------------------------------
+    # 8. OCI RESOURCE HEALTH
+    # ---------------------------------------------------------
+    def check_oci_resources(self) -> HealthCheckResult:
+        try:
+            total, used, free = shutil.disk_usage("/")
+            disk_pct = used / total * 100.0
+
+            mem_total = 0
+            mem_available = 0
+
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_total = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        mem_available = int(line.split()[1])
+
+            memory_pct = (
+                (mem_total - mem_available) / mem_total * 100.0
+                if mem_total
+                else 0.0
+            )
+
+            load_1m = os.getloadavg()[0]
+            cpu_count = os.cpu_count() or 1
+
+            blockers = []
+            warnings = []
+
+            if disk_pct >= 95:
+                blockers.append(f"Disk usage critical: {disk_pct:.1f}%")
+            elif disk_pct >= 85:
+                warnings.append(f"Disk usage high: {disk_pct:.1f}%")
+
+            if memory_pct >= 95:
+                blockers.append(
+                    f"Memory usage critical: {memory_pct:.1f}%"
+                )
+            elif memory_pct >= 85:
+                warnings.append(
+                    f"Memory usage high: {memory_pct:.1f}%"
+                )
+
+            if load_1m > cpu_count * 1.5:
+                warnings.append(
+                    f"CPU load high: {load_1m:.2f} "
+                    f"on {cpu_count} CPU(s)"
+                )
+
+            if blockers:
+                return HealthCheckResult(
+                    "OCI_RESOURCE_HEALTH",
+                    "BLOCKER",
+                    "; ".join(blockers),
+                )
+
+            if warnings:
+                return HealthCheckResult(
+                    "OCI_RESOURCE_HEALTH",
+                    "WARNING",
+                    "; ".join(warnings),
+                )
+
+            return HealthCheckResult(
+                "OCI_RESOURCE_HEALTH",
+                "OK",
+                "OCI CPU, memory and disk resources healthy",
+                {
+                    "disk_used_pct": round(disk_pct, 1),
+                    "memory_used_pct": round(memory_pct, 1),
+                    "load_1m": round(load_1m, 2),
+                },
+            )
+
+        except Exception as exc:
+            return HealthCheckResult(
+                "OCI_RESOURCE_HEALTH",
+                "WARNING",
+                f"OCI resource inspection failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    # ---------------------------------------------------------
+    # ALL CHECKS
+    # ---------------------------------------------------------
     def run_all_checks(self) -> List[HealthCheckResult]:
-        """Runs all 6 health check domains."""
         return [
             self.check_model_health(),
             self.check_system_blockers(),
@@ -338,146 +631,284 @@ class AlgoHealthAgent:
             self.check_token_blockages(),
             self.check_logic_and_database(),
             self.check_action_decision_gate(),
+            self.check_runtime_activity(),
+            self.check_oci_resources(),
         ]
 
-    # ------------------------------------------------------------------
-    # Report Generators & Telegram Senders
-    # ------------------------------------------------------------------
+    def _today_summary(self) -> Dict:
+        today = now_ist_naive().date().isoformat()
+
+        with self.db.get_connection() as conn:
+
+            orders = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM orders
+                WHERE substr(created_at,1,10)=?
+                """,
+                (today,),
+            ).fetchone()[0]
+
+            trades = conn.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(net_pnl),0)
+                FROM trade_journal
+                WHERE substr(exit_time,1,10)=?
+                """,
+                (today,),
+            ).fetchone()
+
+            blocked = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM blocked_signals
+                WHERE substr(timestamp,1,10)=?
+                """,
+                (today,),
+            ).fetchone()[0]
+
+            regime_events = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM regime_log
+                WHERE substr(timestamp,1,10)=?
+                """,
+                (today,),
+            ).fetchone()[0]
+
+        return {
+            "orders_today": int(orders),
+            "trades_closed_today": int(trades[0]),
+            "net_pnl_today": float(trades[1]),
+            "blocked_signals_today": int(blocked),
+            "regime_events_today": int(regime_events),
+            "open_positions": len(self.db.get_open_positions()),
+            "pending_signals": len(self.db.get_pending_signals()),
+        }
+
+    # ---------------------------------------------------------
+    # TELEGRAM REPORTS
+    # ---------------------------------------------------------
     def send_morning_report(self) -> bool:
-        """Dispatches the Morning Health & Readiness Report via Telegram."""
         results = self.run_all_checks()
-        now_str = now_ist_naive().strftime("%Y-%m-%d %H:%M:%S IST")
 
         blockers = [r for r in results if r.status == "BLOCKER"]
         warnings = [r for r in results if r.status == "WARNING"]
-        overall_status = "🔴 BLOCKED" if blockers else ("🟡 WARNINGS" if warnings else "🟢 ALL SYSTEMS READY")
 
-        msg_lines = [
-            "🌅 <b>ALGO TRADING SYSTEM — MORNING HEALTH REPORT</b>\n",
-            f"• <b>Timestamp:</b> {now_str}",
-            f"• <b>Overall Readiness:</b> {overall_status}",
-            f"• <b>Mode:</b> PAPER TRADING (Capital: ₹30,000.00)\n",
-            "<b>Domain Diagnostics:</b>",
+        if blockers:
+            overall = "🔴 BLOCKED"
+        elif warnings:
+            overall = "🟡 WARNING"
+        else:
+            overall = "🟢 READY"
+
+        capital = paper_starting_capital()
+
+        lines = [
+            "🌅 <b>ALGO SYSTEM — MORNING HEALTH</b>",
+            "",
+            f"• <b>Time:</b> "
+            f"{now_ist_naive().strftime('%Y-%m-%d %H:%M:%S IST')}",
+            f"• <b>Status:</b> {overall}",
+            f"• <b>Mode:</b> PAPER",
+            f"• <b>Starting Capital:</b> ₹{capital:,.2f}",
+            "",
         ]
 
-        for r in results:
-            icon = "🟢" if r.status == "OK" else ("🟡" if r.status == "WARNING" else "🔴")
-            msg_lines.append(f"{icon} <b>{r.domain}:</b> {r.message}")
+        for result in results:
+            icon = {
+                "OK": "🟢",
+                "WARNING": "🟡",
+                "BLOCKER": "🔴",
+            }[result.status]
 
-        msg_lines.append("\n<i>Pre-market health check completed. Decision ApprovalGate ready.</i>")
-        report_text = "\n".join(msg_lines)
+            lines.append(
+                f"{icon} <b>{result.domain}</b>: {result.message}"
+            )
 
-        print("=== MORNING HEALTH REPORT ===")
-        print(report_text)
+        text = "\n".join(lines)
+        print(text)
 
-        if self.telegram.is_configured():
-            ok, msg_id, err = self.telegram.send_message(report_text)
-            if ok:
-                log.info("Morning health report sent via Telegram (msg_id: %s)", msg_id)
-                return True
-            log.warning("Failed to send morning health report: %s", err)
+        if not self.telegram.is_configured():
+            log.error("Telegram not configured")
             return False
-        log.info("Telegram not configured; output printed locally.")
-        return True
+
+        ok, _, error = self.telegram.send_message(text)
+
+        if not ok:
+            log.error("Morning Telegram failed: %s", error)
+
+        return ok
 
     def send_eod_report(self) -> bool:
-        """Dispatches the End-Of-Day Summary Report via Telegram."""
-        now_str = now_ist_naive().strftime("%Y-%m-%d %H:%M:%S IST")
+        results = self.run_all_checks()
+        summary = self._today_summary()
+
+        blockers = [r for r in results if r.status == "BLOCKER"]
+        warnings = [r for r in results if r.status == "WARNING"]
+
+        if blockers:
+            overall = "🔴 ISSUE DETECTED"
+        elif warnings:
+            overall = "🟡 WARNING"
+        else:
+            overall = "🟢 HEALTHY"
+
         analytics = AnalyticsEngine(self.db)
-        metrics = analytics.compute_performance_metrics()
-        max_dd = metrics.get("max_drawdown", metrics.get("max_drawdown_pct", 0.0))
+        cumulative = analytics.compute_performance_metrics()
 
-        universe_cfg = project_config("universe.yaml")["universe"]
-        symbols_count = len(universe_cfg["equities"]) + len(universe_cfg["etfs"])
-
-        msg_text = (
-            f"🌆 <b>ALGO TRADING SYSTEM — END OF DAY REPORT</b>\n\n"
-            f"• <b>Timestamp:</b> {now_str}\n"
-            f"• <b>Scanned Universe:</b> {symbols_count} symbols\n"
-            f"• <b>Total Trades Executed:</b> {metrics['total_trades']}\n"
-            f"• <b>Win Rate:</b> {metrics['win_rate_pct']:.1f}%\n"
-            f"• <b>Profit Factor:</b> {metrics['profit_factor']:.2f}\n"
-            f"• <b>Net Realized P&L:</b> ₹{metrics['net_pnl']:,.2f}\n"
-            f"• <b>Max Drawdown:</b> ₹{max_dd:,.2f}\n\n"
-            f"<i>EOD Reconciliation completed. Decision Action Gate logged cleanly.</i>"
+        universe = project_config("universe.yaml")["universe"]
+        configured_symbols = (
+            len(universe["equities"]) + len(universe["etfs"])
         )
 
-        print("=== END OF DAY REPORT ===")
-        print(msg_text)
-
-        if self.telegram.is_configured():
-            ok, msg_id, err = self.telegram.send_message(msg_text)
-            if ok:
-                log.info("EOD report sent via Telegram (msg_id: %s)", msg_id)
-                return True
-            log.warning("Failed to send EOD report: %s", err)
-            return False
-        log.info("Telegram not configured; output printed locally.")
-        return True
-
-    def send_issue_alert_if_any(self) -> bool:
-        """Runs checks and immediately dispatches an alert if any blocker or warning is detected."""
-        results = self.run_all_checks()
-        issues = [r for r in results if r.status in ("BLOCKER", "WARNING")]
-
-        if not issues:
-            log.info("Health check clear: zero blockers or warnings detected.")
-            return True
-
-        now_str = now_ist_naive().strftime("%Y-%m-%d %H:%M:%S IST")
-        alert_lines = [
-            "🚨 <b>ALGO TRADING SYSTEM — ISSUE DETECTED</b>\n",
-            f"• <b>Timestamp:</b> {now_str}",
-            f"• <b>Issues Count:</b> {len(issues)}\n",
-            "<b>Details:</b>"
+        lines = [
+            "🌆 <b>ALGO SYSTEM — END OF DAY REPORT</b>",
+            "",
+            f"• <b>Time:</b> "
+            f"{now_ist_naive().strftime('%Y-%m-%d %H:%M:%S IST')}",
+            f"• <b>System Health:</b> {overall}",
+            f"• <b>Configured Universe:</b> {configured_symbols}",
+            "",
+            "<b>Today's Runtime</b>",
+            f"• Orders opened: {summary['orders_today']}",
+            f"• Trades closed: {summary['trades_closed_today']}",
+            f"• Net realized P&L: "
+            f"₹{summary['net_pnl_today']:,.2f}",
+            f"• Blocked signals: "
+            f"{summary['blocked_signals_today']}",
+            f"• Regime/scan events: "
+            f"{summary['regime_events_today']}",
+            f"• Open positions: {summary['open_positions']}",
+            f"• Pending signals: {summary['pending_signals']}",
+            "",
+            "<b>Cumulative Paper Performance</b>",
+            f"• Total trades: {cumulative['total_trades']}",
+            f"• Win rate: {cumulative['win_rate_pct']:.1f}%",
+            f"• Profit factor: {cumulative['profit_factor']:.2f}",
+            f"• Net P&L: ₹{cumulative['net_pnl']:,.2f}",
+            "",
+            "<b>Health Exceptions</b>",
         ]
 
-        for issue in issues:
-            icon = "🔴" if issue.status == "BLOCKER" else "🟡"
-            alert_lines.append(f"{icon} [<b>{issue.domain}</b>] {issue.message}")
+        issues = [
+            r
+            for r in results
+            if r.status in ("WARNING", "BLOCKER")
+        ]
 
-        alert_lines.append("\n⚠️ <i>Immediate attention recommended to resolve blocker.</i>")
-        alert_text = "\n".join(alert_lines)
+        if not issues:
+            lines.append("🟢 None")
+        else:
+            for result in issues:
+                icon = "🔴" if result.status == "BLOCKER" else "🟡"
+                lines.append(
+                    f"{icon} {result.domain}: {result.message}"
+                )
 
-        print("=== INSTANT ISSUE ALERT ===")
-        print(alert_text)
+        text = "\n".join(lines)
+        print(text)
 
-        if self.telegram.is_configured():
-            ok, msg_id, err = self.telegram.send_message(alert_text)
-            if ok:
-                log.info("Issue alert dispatched via Telegram (msg_id: %s)", msg_id)
-                return True
-            log.warning("Failed to send Telegram issue alert: %s", err)
+        if not self.telegram.is_configured():
+            log.error("Telegram not configured")
             return False
-        log.info("Telegram not configured; issue alert printed locally.")
-        return False
+
+        ok, _, error = self.telegram.send_message(text)
+
+        if not ok:
+            log.error("EOD Telegram failed: %s", error)
+
+        return ok
+
+    def send_issue_alert_if_any(
+        self,
+        results: Optional[List[HealthCheckResult]] = None,
+    ) -> bool:
+
+        results = results or self.run_all_checks()
+
+        issues = [
+            r
+            for r in results
+            if r.status in ("WARNING", "BLOCKER")
+        ]
+
+        if not issues:
+            return True
+
+        lines = [
+            "🚨 <b>ALGO SYSTEM — HEALTH ALERT</b>",
+            "",
+            f"• <b>Time:</b> "
+            f"{now_ist_naive().strftime('%Y-%m-%d %H:%M:%S IST')}",
+            "",
+        ]
+
+        for result in issues:
+            icon = "🔴" if result.status == "BLOCKER" else "🟡"
+            lines.append(
+                f"{icon} <b>{result.domain}</b>: {result.message}"
+            )
+
+        text = "\n".join(lines)
+        print(text)
+
+        if not self.telegram.is_configured():
+            return False
+
+        ok, _, error = self.telegram.send_message(text)
+
+        if not ok:
+            log.error("Telegram health alert failed: %s", error)
+
+        return ok
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Independent Algo Models Health Agent")
+    parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "--mode",
         choices=["morning", "eod", "check"],
         default="check",
-        help="Mode: morning (pre-market report), eod (post-market summary), check (diagnostic with instant issue alert)"
     )
+
     args = parser.parse_args()
 
     agent = AlgoHealthAgent()
 
     if args.mode == "morning":
-        agent.send_morning_report()
-    elif args.mode == "eod":
-        agent.send_eod_report()
-    elif args.mode == "check":
-        results = agent.run_all_checks()
-        blockers = [r for r in results if r.status == "BLOCKER"]
-        if blockers:
-            agent.send_issue_alert_if_any()
+        sys.exit(0 if agent.send_morning_report() else 1)
+
+    if args.mode == "eod":
+        sys.exit(0 if agent.send_eod_report() else 1)
+
+    results = agent.run_all_checks()
+
+    issues = [
+        r
+        for r in results
+        if r.status in ("WARNING", "BLOCKER")
+    ]
+
+    blockers = [
+        r
+        for r in results
+        if r.status == "BLOCKER"
+    ]
+
+    if issues:
+        delivered = agent.send_issue_alert_if_any(results)
+
+        if not delivered:
             sys.exit(1)
-        else:
-            print("HEALTH CHECK PASSED: All 6 domains operational.")
-            sys.exit(0)
+
+    if blockers:
+        sys.exit(1)
+
+    print("HEALTH CHECK PASSED")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

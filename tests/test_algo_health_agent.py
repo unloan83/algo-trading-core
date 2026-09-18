@@ -15,12 +15,13 @@ class TestAlgoHealthAgent(unittest.TestCase):
         res = self.agent.check_model_health()
         self.assertEqual(res.domain, "MODEL_HEALTH")
         self.assertEqual(res.status, "OK")
-        self.assertIn("breakout_model", res.details)
+        self.assertIn("breakout", res.details)
 
     @patch("scripts.algo_health_agent.CircuitTracker")
     def test_check_system_blockers_clear(self, mock_tracker_cls):
         mock_tracker = mock_tracker_cls.return_value
         mock_tracker.compute_mark_to_market_pnl.return_value = (0.0, 0.0, 0.0)
+        self.mock_db.paper_account.return_value = (30000.0, 30000.0)
         self.mock_db.get_latest_circuit_state.return_value = {"consecutive_losses": 0, "last_loss_time": None}
         self.mock_db.get_open_positions.return_value = []
 
@@ -31,14 +32,15 @@ class TestAlgoHealthAgent(unittest.TestCase):
     @patch("scripts.algo_health_agent.CircuitTracker")
     def test_check_system_blockers_tripped(self, mock_tracker_cls):
         mock_tracker = mock_tracker_cls.return_value
-        mock_tracker.compute_mark_to_market_pnl.return_value = (0.0, 0.0, 0.0)
+        mock_tracker.compute_mark_to_market_pnl.return_value = (-5000.0, 0.0, 0.0)
+        self.mock_db.paper_account.return_value = (30000.0, 30000.0)
         self.mock_db.get_latest_circuit_state.return_value = {"consecutive_losses": 3, "last_loss_time": None}
         self.mock_db.get_open_positions.return_value = []
 
         res = self.agent.check_system_blockers()
         self.assertEqual(res.domain, "SYSTEM_BLOCKERS")
         self.assertEqual(res.status, "BLOCKER")
-        self.assertIn("Circuit breaker active", res.message)
+        self.assertIn("Daily circuit breached", res.message)
 
     def test_check_token_blockages_missing_env(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -56,14 +58,16 @@ class TestAlgoHealthAgent(unittest.TestCase):
     def test_check_action_decision_gate(self):
         res = self.agent.check_action_decision_gate()
         self.assertEqual(res.domain, "ACTION_DECISION_GATE")
-        self.assertIn(res.status, ("OK", "WARNING"))
+        self.assertIn(res.status, ("OK", "WARNING", "BLOCKER"))
         self.assertIn("timeout_seconds", res.details)
 
-    def test_run_all_checks_returns_six_domains(self):
-        with patch.dict(os.environ, {"UPSTOX_ANALYTICS_TOKEN": "mock_token"}):
+    def test_run_all_checks_returns_eight_domains(self):
+        with patch.dict(os.environ, {"UPSTOX_ANALYTICS_TOKEN": "mock_token", "PAPER_STARTING_CAPITAL": "30000"}):
             self.mock_broker.validate_readonly_access.return_value = (True, "Token valid")
+            self.mock_db.paper_account.return_value = (30000.0, 30000.0)
             results = self.agent.run_all_checks()
-            self.assertEqual(len(results), 6)
+
+            self.assertEqual(len(results), 8)
             domains = [r.domain for r in results]
             expected_domains = [
                 "MODEL_HEALTH",
@@ -72,6 +76,8 @@ class TestAlgoHealthAgent(unittest.TestCase):
                 "TOKEN_VALIDITY",
                 "LOGIC_DB",
                 "ACTION_DECISION_GATE",
+                "RUNTIME_ACTIVITY",
+                "OCI_RESOURCE_HEALTH",
             ]
             self.assertEqual(domains, expected_domains)
 
