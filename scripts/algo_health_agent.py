@@ -30,12 +30,17 @@ from core.paper_engine import paper_starting_capital
 from core.screener import Screener
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
+from data.universe_selector import (
+    load_active_universe,
+    load_active_universe_metadata,
+)
 from journal.analytics import AnalyticsEngine
 from scripts.runtime_common import (
     build_risk_governor,
     load_market_filters,
     now_ist_naive,
     project_config,
+    read_runtime_marker,
 )
 from telegram_bot.approval_gate import ApprovalGate
 from telegram_bot.telegram_client import TelegramClient
@@ -67,13 +72,16 @@ class AlgoHealthAgent:
         self.telegram = TelegramClient()
         self.governor = build_risk_governor()
 
+    def _active_symbols(self) -> List[str]:
+        cfg = project_config("universe.yaml")["universe"]
+        return load_active_universe(cfg)
+
     # ---------------------------------------------------------
     # 1. MODEL HEALTH
     # ---------------------------------------------------------
     def check_model_health(self) -> HealthCheckResult:
         try:
-            universe = project_config("universe.yaml")["universe"]
-            symbols = universe["equities"] + universe["etfs"]
+            symbols = self._active_symbols()
 
             Screener(symbols)
 
@@ -84,7 +92,7 @@ class AlgoHealthAgent:
                 {
                     "breakout": evaluate_breakout.__name__,
                     "trend_pullback": evaluate_trend_pullback.__name__,
-                    "configured_symbols": len(symbols),
+                    "active_symbols": len(symbols),
                 },
             )
 
@@ -271,8 +279,7 @@ class AlgoHealthAgent:
                     )
 
             # Validate every configured instrument ID.
-            universe = project_config("universe.yaml")["universe"]
-            symbols = universe["equities"] + universe["etfs"]
+            symbols = self._active_symbols()
 
             bad_symbols = []
             instrument_keys = set()
@@ -308,7 +315,7 @@ class AlgoHealthAgent:
             return HealthCheckResult(
                 "DATA_INTEGRITY",
                 "OK",
-                "Upstox data, timestamps and instrument IDs verified",
+                "Upstox data and dynamic Top-100 universe verified",
                 {
                     "latest_candle": str(latest_ts),
                     "candles": len(df),
@@ -438,103 +445,123 @@ class AlgoHealthAgent:
     # 7. ACTUAL RUNTIME ACTIVITY
     # Proves that preflight / intraday / EOD actually ran.
     # ---------------------------------------------------------
+    @staticmethod
+    def _marker_age_minutes(marker, now):
+        if not marker or not marker.get("timestamp"):
+            return None
+        return (now - marker["timestamp"]).total_seconds() / 60.0
+
+    def _require_success_today(
+        self,
+        service,
+        label,
+        now,
+        blockers,
+        max_age_minutes=None,
+    ):
+        marker = read_runtime_marker(service)
+        if not marker:
+            blockers.append(f"{label} execution marker missing")
+            return None
+
+        if marker["timestamp"].date() != now.date():
+            blockers.append(f"{label} has no execution evidence today")
+            return marker
+
+        if marker["status"] != "SUCCESS":
+            suffix = f": {marker['message']}" if marker.get("message") else ""
+            blockers.append(f"{label} last status={marker['status']}{suffix}")
+            return marker
+
+        if max_age_minutes is not None:
+            age = self._marker_age_minutes(marker, now)
+            if age is None or age > max_age_minutes:
+                blockers.append(
+                    f"{label} heartbeat stale: {age:.1f} minutes"
+                    if age is not None
+                    else f"{label} heartbeat timestamp missing"
+                )
+        return marker
+
     def check_runtime_activity(self) -> HealthCheckResult:
         try:
             now = now_ist_naive()
-
-            # Morning preflight must have produced today's filter cache.
-            try:
-                load_market_filters()
-                preflight_ok = True
-            except Exception as exc:
-                preflight_ok = False
-                preflight_error = str(exc)
-
-            with self.db.get_connection() as conn:
-                date_str = now.date().isoformat()
-
-                intraday_events = conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM regime_log
-                    WHERE substr(timestamp,1,10)=?
-                      AND rationale LIKE 'intraday:%'
-                    """,
-                    (date_str,),
-                ).fetchone()[0]
-
-                eod_events = conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM regime_log
-                    WHERE substr(timestamp,1,10)=?
-                      AND rationale NOT LIKE 'intraday:%'
-                    """,
-                    (date_str,),
-                ).fetchone()[0]
-
             trading_day = self.broker.is_nse_trading_day(now.date())
-
             blockers = []
+            details = {}
 
-            if now.time() >= time(8, 50) and not preflight_ok:
-                blockers.append(
-                    f"Morning preflight evidence missing: {preflight_error}"
+            if now.time() >= time(8, 50):
+                marker = self._require_success_today(
+                    "preflight", "Morning preflight", now, blockers
                 )
+                details["preflight"] = marker
+                if marker and marker["status"] == "SUCCESS":
+                    try:
+                        load_market_filters()
+                        self._active_symbols()
+                    except Exception as exc:
+                        blockers.append(f"Preflight artifacts invalid: {exc}")
 
-            if trading_day:
-                if now.time() >= time(9, 45) and intraday_events == 0:
+            if trading_day and now.time() >= time(9, 45):
+                max_age = 20.0 if now.time() <= time(14, 20) else None
+                marker = self._require_success_today(
+                    "intraday_scan",
+                    "Intraday scanner",
+                    now,
+                    blockers,
+                    max_age_minutes=max_age,
+                )
+                details["intraday_scan"] = marker
+
+            if trading_day and now.time() >= time(9, 20):
+                max_age = 5.0 if now.time() <= time(15, 30) else None
+                marker = self._require_success_today(
+                    "paper_monitor",
+                    "Paper exit monitor",
+                    now,
+                    blockers,
+                    max_age_minutes=max_age,
+                )
+                details["paper_monitor"] = marker
+
+            if trading_day and now.time() >= time(16, 5):
+                marker = self._require_success_today(
+                    "eod_screener", "EOD screener", now, blockers
+                )
+                details["eod_screener"] = marker
+
+            if trading_day and now.time() >= time(15, 20):
+                intraday_open = [
+                    p.symbol
+                    for p in self.db.get_open_positions()
+                    if p.is_intraday
+                ]
+                if intraday_open:
                     blockers.append(
-                        "No intraday scanner execution evidence today"
+                        "Intraday positions remain open after mandatory "
+                        "square-off: " + ", ".join(intraday_open)
                     )
-
-                if now.time() >= time(16, 5) and eod_events == 0:
-                    blockers.append(
-                        "No EOD screener execution evidence today"
-                    )
-
-                if now.time() >= time(15, 20):
-                    intraday_open = [
-                        p.symbol
-                        for p in self.db.get_open_positions()
-                        if p.is_intraday
-                    ]
-
-                    if intraday_open:
-                        blockers.append(
-                            "Intraday positions remain open after mandatory "
-                            "square-off: "
-                            + ", ".join(intraday_open)
-                        )
 
             if blockers:
                 return HealthCheckResult(
                     "RUNTIME_ACTIVITY",
                     "BLOCKER",
                     "; ".join(blockers),
-                    {
-                        "intraday_regime_events": intraday_events,
-                        "eod_regime_events": eod_events,
-                    },
+                    details,
                 )
 
             return HealthCheckResult(
                 "RUNTIME_ACTIVITY",
                 "OK",
-                "Expected runtime activity present",
-                {
-                    "preflight_cache": preflight_ok,
-                    "intraday_regime_events": intraday_events,
-                    "eod_regime_events": eod_events,
-                },
+                "Scheduled trading runtime heartbeats verified",
+                details,
             )
 
         except Exception as exc:
             return HealthCheckResult(
                 "RUNTIME_ACTIVITY",
                 "BLOCKER",
-                f"Runtime activity check failed: "
-                f"{type(exc).__name__}: {exc}",
+                f"Runtime activity check failed: {type(exc).__name__}: {exc}",
             )
 
     # ---------------------------------------------------------
@@ -704,6 +731,8 @@ class AlgoHealthAgent:
             overall = "🟢 READY"
 
         capital = paper_starting_capital()
+        universe_meta = load_active_universe_metadata()
+        universe_count = len(universe_meta.get("selected", []))
 
         lines = [
             "🌅 <b>ALGO SYSTEM — MORNING HEALTH</b>",
@@ -713,6 +742,7 @@ class AlgoHealthAgent:
             f"• <b>Status:</b> {overall}",
             f"• <b>Mode:</b> PAPER",
             f"• <b>Starting Capital:</b> ₹{capital:,.2f}",
+            f"• <b>Dynamic Universe:</b> {universe_count} / NIFTY 200",
             "",
         ]
 
@@ -758,10 +788,7 @@ class AlgoHealthAgent:
         analytics = AnalyticsEngine(self.db)
         cumulative = analytics.compute_performance_metrics()
 
-        universe = project_config("universe.yaml")["universe"]
-        configured_symbols = (
-            len(universe["equities"]) + len(universe["etfs"])
-        )
+        configured_symbols = len(self._active_symbols())
 
         lines = [
             "🌆 <b>ALGO SYSTEM — END OF DAY REPORT</b>",
@@ -769,7 +796,7 @@ class AlgoHealthAgent:
             f"• <b>Time:</b> "
             f"{now_ist_naive().strftime('%Y-%m-%d %H:%M:%S IST')}",
             f"• <b>System Health:</b> {overall}",
-            f"• <b>Configured Universe:</b> {configured_symbols}",
+            f"• <b>Dynamic Universe:</b> {configured_symbols} / NIFTY 200",
             "",
             "<b>Today's Runtime</b>",
             f"• Orders opened: {summary['orders_today']}",
