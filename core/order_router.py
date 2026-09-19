@@ -50,6 +50,10 @@ class OrderRouter:
 
     There is deliberately no Upstox order-placement implementation in this class.
     """
+    @staticmethod
+    def live_order_path_status() -> str:
+        return "DISABLED"
+
     def __init__(self, live_mode: bool = False, slippage_pct: float = 0.05):
         if live_mode:
             raise RuntimeError("LIVE_TRADING_DISABLED_DURING_30_DAY_PAPER_GATE")

@@ -25,7 +25,7 @@ from scripts.runtime_common import (
     load_market_filters,
     write_runtime_marker,
 )
-from telegram_bot.approval_gate import ApprovalGate
+from telegram_bot.approval_gate import ApprovalGate, compute_signal_id
 from telegram_bot.telegram_client import TelegramClient
 
 logging.basicConfig(level=logging.INFO)
@@ -96,7 +96,7 @@ def main():
     router = OrderRouter(live_mode=False)
     risk_cfg = project_config("risk_limits.yaml")
 
-    telegram = TelegramClient()
+    telegram = TelegramClient(callback_store=db)
     if not telegram.is_configured():
         raise SystemExit("TELEGRAM_NOT_CONFIGURED_OR_ALLOWLIST_MISSING")
     approval = ApprovalGate(
@@ -148,6 +148,7 @@ def main():
             symbol_data[symbol] = df
 
     signals = Screener(symbols).run_intraday_scan(symbol_data, nifty, regime)
+    db.record_signal_evaluations(signals, evaluated_at=now)
     max_orders = int(timing["max_orders_per_day"])
     for sig in signals:
         if db.count_paper_orders_on_date(now.date().isoformat(), intraday_only=True) >= max_orders:
@@ -170,7 +171,9 @@ def main():
         decision = approval.process_signal(
             sig, risk,
             telegram_send_fn=telegram.send_approval,
-            human_response_callback=telegram.poll_callback_query,
+            human_response_callback=lambda signal_id=compute_signal_id(sig): (
+                telegram.poll_callback_query(signal_id=signal_id)
+            ),
         )
 
         if decision["action"] == "APPROVED":

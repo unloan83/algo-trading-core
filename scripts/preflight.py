@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
+from core.order_router import OrderRouter
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
 from data.universe_selector import build_and_cache_dynamic_universe
@@ -97,7 +98,7 @@ def main():
     print("upstox_live_ltp=OK")
     print("upstox_historical_data=OK")
     print("telegram=allowlisted long-polling configured")
-    print("live_order_path=DISABLED")
+    print(f"live_order_path={OrderRouter.live_order_path_status()}")
 
 
 if __name__ == "__main__":

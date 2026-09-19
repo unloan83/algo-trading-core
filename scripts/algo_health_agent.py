@@ -41,6 +41,7 @@ from scripts.runtime_common import (
     now_ist_naive,
     project_config,
     read_runtime_marker,
+    write_runtime_marker,
 )
 from telegram_bot.approval_gate import ApprovalGate
 from telegram_bot.telegram_client import TelegramClient
@@ -188,6 +189,9 @@ class AlgoHealthAgent:
                         "weekly_pnl": weekly,
                         "monthly_pnl": monthly,
                         "equity": equity,
+                        "daily_circuit_used_pct": daily_loss_pct,
+                        "weekly_circuit_used_pct": weekly_loss_pct,
+                        "monthly_circuit_used_pct": monthly_loss_pct,
                     },
                 )
 
@@ -201,6 +205,9 @@ class AlgoHealthAgent:
                     "monthly_pnl": monthly,
                     "equity": equity,
                     "open_positions": len(positions),
+                    "daily_circuit_used_pct": daily_loss_pct,
+                    "weekly_circuit_used_pct": weekly_loss_pct,
+                    "monthly_circuit_used_pct": monthly_loss_pct,
                 },
             )
 
@@ -670,57 +677,9 @@ class AlgoHealthAgent:
             self.check_oci_resources(),
         ]
 
-    def _today_summary(self) -> Dict:
-        today = now_ist_naive().date().isoformat()
-
-        with self.db.get_connection() as conn:
-
-            orders = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM orders
-                WHERE substr(created_at,1,10)=?
-                """,
-                (today,),
-            ).fetchone()[0]
-
-            trades = conn.execute(
-                """
-                SELECT COUNT(*),
-                       COALESCE(SUM(net_pnl),0)
-                FROM trade_journal
-                WHERE substr(exit_time,1,10)=?
-                """,
-                (today,),
-            ).fetchone()
-
-            blocked = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM blocked_signals
-                WHERE substr(timestamp,1,10)=?
-                """,
-                (today,),
-            ).fetchone()[0]
-
-            regime_events = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM regime_log
-                WHERE substr(timestamp,1,10)=?
-                """,
-                (today,),
-            ).fetchone()[0]
-
-        return {
-            "orders_today": int(orders),
-            "trades_closed_today": int(trades[0]),
-            "net_pnl_today": float(trades[1]),
-            "blocked_signals_today": int(blocked),
-            "regime_events_today": int(regime_events),
-            "open_positions": len(self.db.get_open_positions()),
-            "pending_signals": len(self.db.get_pending_signals()),
-        }
+    def today_summary(self, date_iso: Optional[str] = None) -> Dict:
+        today = date_iso or now_ist_naive().date().isoformat()
+        return self.db.get_today_summary(today)
 
     # ---------------------------------------------------------
     # TELEGRAM REPORTS
@@ -784,7 +743,7 @@ class AlgoHealthAgent:
 
     def send_eod_report(self) -> bool:
         results = self.run_all_checks()
-        summary = self._today_summary()
+        summary = self.today_summary()
 
         blockers = [r for r in results if r.status == "BLOCKER"]
         warnings = [r for r in results if r.status == "WARNING"]
@@ -810,6 +769,7 @@ class AlgoHealthAgent:
             f"• <b>Dynamic Universe:</b> {configured_symbols} / NIFTY 200",
             "",
             "<b>Today's Runtime</b>",
+            f"• Signals evaluated: {summary['signals_evaluated_today']}",
             f"• Orders opened: {summary['orders_today']}",
             f"• Trades closed: {summary['trades_closed_today']}",
             f"• Net realized P&L: "
@@ -918,10 +878,10 @@ def main():
     agent = AlgoHealthAgent()
 
     if args.mode == "morning":
-        sys.exit(0 if agent.send_morning_report() else 1)
+        return args.mode, 0 if agent.send_morning_report() else 1
 
     if args.mode == "eod":
-        sys.exit(0 if agent.send_eod_report() else 1)
+        return args.mode, 0 if agent.send_eod_report() else 1
 
     results = agent.run_all_checks()
 
@@ -941,14 +901,34 @@ def main():
         delivered = agent.send_issue_alert_if_any(results)
 
         if not delivered:
-            sys.exit(1)
+            return args.mode, 1
 
     if blockers:
-        sys.exit(1)
+        return args.mode, 1
 
     print("HEALTH CHECK PASSED")
-    sys.exit(0)
+    return args.mode, 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        health_mode, exit_code = main()
+    except BaseException as exc:
+        log.error(
+            "Health agent failed: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        write_runtime_marker(
+            "algo_health_agent",
+            "FAILED",
+            f"{type(exc).__name__}:{exc}",
+        )
+        raise
+    else:
+        write_runtime_marker(
+            "algo_health_agent",
+            "SUCCESS" if exit_code == 0 else "FAILED",
+            f"mode={health_mode} exit_code={exit_code}",
+        )
+        raise SystemExit(exit_code)

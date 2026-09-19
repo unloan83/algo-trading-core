@@ -19,7 +19,7 @@ from scripts.runtime_common import (
     save_market_filters,
     write_runtime_marker,
 )
-from telegram_bot.approval_gate import ApprovalGate
+from telegram_bot.approval_gate import ApprovalGate, compute_signal_id
 from telegram_bot.telegram_client import TelegramClient
 
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +55,7 @@ def main():
     regime, rationale = evaluate_regime(nifty_df)
     db.record_regime(regime.value, rationale)
     signals = Screener(symbols).run_eod_screen(symbol_data, nifty_df, regime)
+    db.record_signal_evaluations(signals, evaluated_at=now)
     log.info("Real-data EOD candidates: %d", len(signals))
 
     open_positions = db.get_open_positions()
@@ -79,7 +80,7 @@ def main():
 
     risk_cfg = project_config("risk_limits.yaml")
     timing_cfg = project_config("timing.yaml")["timing"]
-    telegram = TelegramClient()
+    telegram = TelegramClient(callback_store=db)
     approval = ApprovalGate(
         timeout_seconds=int(timing_cfg["telegram_approval_timeout_seconds"]),
         default_action_on_timeout=risk_cfg["default_action_on_timeout"],
@@ -115,7 +116,9 @@ def main():
             sig,
             risk,
             telegram_send_fn=telegram.send_approval,
-            human_response_callback=telegram.poll_callback_query,
+            human_response_callback=lambda signal_id=compute_signal_id(sig): (
+                telegram.poll_callback_query(signal_id=signal_id)
+            ),
         )
 
         if decision["action"] == "APPROVED":

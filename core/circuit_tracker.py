@@ -7,6 +7,12 @@ class CircuitTracker:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
+    @staticmethod
+    def position_mark_to_market(position: Position) -> float:
+        if position.side == Side.BUY:
+            return (position.current_price - position.entry_price) * position.qty
+        return (position.entry_price - position.current_price) * position.qty
+
     def compute_mark_to_market_pnl(
         self,
         open_positions: List[Position],
@@ -22,13 +28,10 @@ class CircuitTracker:
         target_year_num = target_date.year
 
         # 1. Unrealized MTM P&L on currently open positions
-        open_mtm_pnl = 0.0
-        for pos in open_positions:
-            if pos.side == Side.BUY:
-                pos_mtm = (pos.current_price - pos.entry_price) * pos.qty
-            else:
-                pos_mtm = (pos.entry_price - pos.current_price) * pos.qty
-            open_mtm_pnl += pos_mtm
+        open_mtm_pnl = sum(
+            self.position_mark_to_market(position)
+            for position in open_positions
+        )
 
         # 2. Query Realized P&L from trade_journal database table
         with self.db.get_connection() as conn:

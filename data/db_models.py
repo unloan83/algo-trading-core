@@ -2,7 +2,7 @@ import sqlite3
 import os
 import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from core.models import Position, Side, Signal, Order, RegimeType
 
@@ -143,6 +143,19 @@ class DatabaseManager:
                 details TEXT,
                 timestamp TEXT NOT NULL
             );""")
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_callback_inbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                update_id INTEGER NOT NULL UNIQUE,
+                action TEXT NOT NULL,
+                signal_id TEXT,
+                received_at TEXT NOT NULL
+            );""")
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_update_state (
+                consumer TEXT PRIMARY KEY,
+                next_offset INTEGER NOT NULL
+            );""")
             self._ensure_column(c, "positions", "status", "TEXT DEFAULT 'OPEN'")
             self._ensure_column(c, "positions", "is_intraday", "INTEGER DEFAULT 0")
             self._ensure_column(c, "orders", "is_intraday", "INTEGER DEFAULT 0")
@@ -169,6 +182,41 @@ class DatabaseManager:
             )
             for r in rows
         ]
+
+    def record_signal_evaluations(
+        self,
+        signals: List[Signal],
+        evaluated_at: Optional[datetime] = None,
+    ) -> None:
+        timestamp = (evaluated_at or datetime.now()).isoformat()
+        rows = [
+            (
+                f"evaluation_{uuid.uuid4().hex}",
+                signal.symbol,
+                signal.side.value,
+                signal.entry_price,
+                signal.stop_price,
+                signal.target_price,
+                signal.model_name,
+                signal.regime.value,
+                signal.rationale,
+                timestamp,
+            )
+            for signal in signals
+        ]
+        if not rows:
+            return
+        with self.get_connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO signals (
+                    signal_id, symbol, side, entry_price, stop_price,
+                    target_price, model_name, regime, rationale, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
 
     def get_total_realized_pnl(self) -> float:
         with self.get_connection() as conn:
@@ -352,6 +400,70 @@ class DatabaseManager:
             """, (regime, rationale, datetime.now().isoformat()))
             conn.commit()
 
+    def get_latest_regime(self, date_iso: str) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT regime, rationale, timestamp
+                FROM regime_log
+                WHERE substr(timestamp,1,10)=?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (date_iso,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_today_summary(self, date_iso: str) -> Dict[str, Any]:
+        with self.get_connection() as conn:
+            signals = conn.execute(
+                """
+                SELECT COUNT(*) FROM signals
+                WHERE substr(timestamp,1,10)=?
+                """,
+                (date_iso,),
+            ).fetchone()[0]
+            orders = conn.execute(
+                """
+                SELECT COUNT(*) FROM orders
+                WHERE substr(created_at,1,10)=?
+                """,
+                (date_iso,),
+            ).fetchone()[0]
+            trades = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(net_pnl),0)
+                FROM trade_journal
+                WHERE substr(exit_time,1,10)=?
+                """,
+                (date_iso,),
+            ).fetchone()
+            blocked = conn.execute(
+                """
+                SELECT COUNT(*) FROM blocked_signals
+                WHERE substr(timestamp,1,10)=?
+                """,
+                (date_iso,),
+            ).fetchone()[0]
+            regime_events = conn.execute(
+                """
+                SELECT COUNT(*) FROM regime_log
+                WHERE substr(timestamp,1,10)=?
+                """,
+                (date_iso,),
+            ).fetchone()[0]
+
+        return {
+            "signals_evaluated_today": int(signals),
+            "orders_today": int(orders),
+            "trades_closed_today": int(trades[0]),
+            "net_pnl_today": float(trades[1]),
+            "blocked_signals_today": int(blocked),
+            "regime_events_today": int(regime_events),
+            "open_positions": len(self.get_open_positions()),
+            "pending_signals": len(self.get_pending_signals()),
+        }
+
     def record_preflight_success(self, timestamp: Optional[datetime] = None):
         ts = (timestamp or datetime.now()).isoformat()
         with self.get_connection() as conn:
@@ -370,7 +482,99 @@ class DatabaseManager:
             return datetime.fromisoformat(row["timestamp"])
         return None
 
+    def get_last_preflight_time(self) -> Optional[datetime]:
+        with self.get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp FROM system_events
+                WHERE event_type='PREFLIGHT_PASSED'
+                ORDER BY timestamp DESC LIMIT 1
+                """
+            ).fetchone()
+        if row and row["timestamp"]:
+            return datetime.fromisoformat(row["timestamp"])
+        return None
+
     def get_completed_trades_count(self) -> int:
         with self.get_connection() as conn:
             row = conn.execute("SELECT COUNT(*) AS n FROM trade_journal").fetchone()
         return int(row["n"]) if row else 0
+
+    def get_telegram_update_offset(self) -> Optional[int]:
+        with self.get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT next_offset FROM telegram_update_state
+                WHERE consumer='command_listener'
+                """
+            ).fetchone()
+        return int(row["next_offset"]) if row else None
+
+    def set_telegram_update_offset(self, next_offset: int) -> None:
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_update_state (consumer, next_offset)
+                VALUES ('command_listener', ?)
+                ON CONFLICT(consumer) DO UPDATE
+                SET next_offset=excluded.next_offset
+                """,
+                (int(next_offset),),
+            )
+            conn.commit()
+
+    def enqueue_telegram_callback(
+        self,
+        update_id: int,
+        action: str,
+        signal_id: Optional[str],
+    ) -> None:
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO telegram_callback_inbox (
+                    update_id, action, signal_id, received_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    int(update_id),
+                    str(action).upper(),
+                    signal_id,
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def pop_telegram_callback(
+        self,
+        signal_id: Optional[str] = None,
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if signal_id is None:
+                row = conn.execute(
+                    """
+                    SELECT id, action, signal_id
+                    FROM telegram_callback_inbox
+                    ORDER BY id ASC LIMIT 1
+                    """
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT id, action, signal_id
+                    FROM telegram_callback_inbox
+                    WHERE signal_id=?
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (signal_id,),
+                ).fetchone()
+            if not row:
+                conn.commit()
+                return None
+            conn.execute(
+                "DELETE FROM telegram_callback_inbox WHERE id=?",
+                (row["id"],),
+            )
+            conn.commit()
+        return str(row["action"]), row["signal_id"]
