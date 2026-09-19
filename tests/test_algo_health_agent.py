@@ -57,10 +57,15 @@ class TestAlgoHealthAgent(unittest.TestCase):
             self.assertEqual(res.status, "OK")
 
     def test_check_action_decision_gate(self):
-        res = self.agent.check_action_decision_gate()
-        self.assertEqual(res.domain, "ACTION_DECISION_GATE")
-        self.assertIn(res.status, ("OK", "WARNING", "BLOCKER"))
-        self.assertIn("timeout_seconds", res.details)
+        with patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "mock_token",
+            "TELEGRAM_CHAT_ID": "123456",
+            "TELEGRAM_ALLOWED_USER_ID": "123456",
+        }):
+            res = self.agent.check_action_decision_gate()
+            self.assertEqual(res.domain, "ACTION_DECISION_GATE")
+            self.assertIn(res.status, ("OK", "WARNING", "BLOCKER"))
+            self.assertIn("timeout_seconds", res.details)
 
     @patch.object(AlgoHealthAgent, "_active_symbols", return_value=["INFY"])
     def test_run_all_checks_returns_eight_domains(self, _mock_symbols):

@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import List
+from typing import List, Optional
 
 from core.models import Position, Signal, Side, RegimeType
 from core.order_router import OrderRouter
@@ -65,3 +65,29 @@ def pending_row_to_signal(row, actual_entry: float, gap_filter_pct: float) -> Si
         rationale=f"{row['rationale']} | next-session paper entry",
         timestamp=datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None),
     )
+
+
+def paper_gate_status(db: DatabaseManager, as_of: Optional[datetime] = None) -> dict:
+    now = as_of or datetime.now()
+    first_preflight = db.get_first_preflight_time()
+
+    if first_preflight:
+        days_elapsed = max(0, (now.date() - first_preflight.date()).days)
+    else:
+        days_elapsed = 0
+
+    trades_completed = db.get_completed_trades_count()
+
+    days_req = 45
+    trades_req = 20
+
+    gate_cleared = (days_elapsed >= days_req) and (trades_completed >= trades_req)
+
+    return {
+        "days_elapsed": days_elapsed,
+        "days_required": days_req,
+        "trades_completed": trades_completed,
+        "trades_required": trades_req,
+        "first_preflight": first_preflight.isoformat() if first_preflight else None,
+        "gate_cleared": gate_cleared,
+    }

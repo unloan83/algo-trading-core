@@ -57,17 +57,18 @@ class TelegramClient:
         except Exception as exc:
             return False, None, f"Telegram HTTP exception: {exc}"
 
-    def send_approval(self, text: str, _buttons=None):
+    def send_approval(self, text: str, signal_id: Optional[str] = None):
+        suffix = f":{signal_id}" if signal_id else ""
         keyboard = [[
-            {"text": "✅ APPROVE", "callback_data": "APPROVE"},
-            {"text": "⛔ SKIP", "callback_data": "SKIP"},
-            {"text": "⏸ HOLD", "callback_data": "HOLD"},
+            {"text": "✅ APPROVE", "callback_data": f"APPROVE{suffix}"},
+            {"text": "⛔ SKIP", "callback_data": f"SKIP{suffix}"},
+            {"text": "⏸ HOLD", "callback_data": f"HOLD{suffix}"},
         ]]
         return self.send_message(text, keyboard)
 
-    def poll_callback_query(self, timeout: int = 2) -> Optional[str]:
+    def poll_callback_query(self, timeout: int = 2) -> Tuple[Optional[str], Optional[str]]:
         if not self.is_configured():
-            return None
+            return None, None
         params = {"timeout": timeout}
         if self._offset is not None:
             params["offset"] = self._offset
@@ -79,7 +80,7 @@ class TelegramClient:
             )
             data = resp.json()
             if not data.get("ok"):
-                return None
+                return None, None
             for update in data.get("result", []):
                 self._offset = update["update_id"] + 1
                 cb = update.get("callback_query")
@@ -93,7 +94,11 @@ class TelegramClient:
                 if message_chat_id and message_chat_id != self.chat_id:
                     logger.warning("Ignored Telegram callback from unauthorized chat")
                     continue
-                return str(cb.get("data") or "").upper()
+                raw_data = str(cb.get("data") or "").strip()
+                if ":" in raw_data:
+                    action, cb_id = raw_data.split(":", 1)
+                    return action.upper(), cb_id.strip()
+                return raw_data.upper(), None
         except Exception:
-            return None
-        return None
+            return None, None
+        return None, None

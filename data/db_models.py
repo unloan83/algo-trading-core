@@ -136,6 +136,13 @@ class DatabaseManager:
                 approved_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'PENDING'
             );""")
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS system_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                details TEXT,
+                timestamp TEXT NOT NULL
+            );""")
             self._ensure_column(c, "positions", "status", "TEXT DEFAULT 'OPEN'")
             self._ensure_column(c, "positions", "is_intraday", "INTEGER DEFAULT 0")
             self._ensure_column(c, "orders", "is_intraday", "INTEGER DEFAULT 0")
@@ -344,3 +351,26 @@ class DatabaseManager:
                 VALUES (?, ?, ?)
             """, (regime, rationale, datetime.now().isoformat()))
             conn.commit()
+
+    def record_preflight_success(self, timestamp: Optional[datetime] = None):
+        ts = (timestamp or datetime.now()).isoformat()
+        with self.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO system_events (event_type, details, timestamp) VALUES (?, ?, ?)",
+                ("PREFLIGHT_PASSED", "Preflight check passed", ts),
+            )
+            conn.commit()
+
+    def get_first_preflight_time(self) -> Optional[datetime]:
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT timestamp FROM system_events WHERE event_type='PREFLIGHT_PASSED' ORDER BY timestamp ASC LIMIT 1"
+            ).fetchone()
+        if row and row["timestamp"]:
+            return datetime.fromisoformat(row["timestamp"])
+        return None
+
+    def get_completed_trades_count(self) -> int:
+        with self.get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM trade_journal").fetchone()
+        return int(row["n"]) if row else 0

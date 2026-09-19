@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from data.broker_client import UnifiedBrokerClient
+from data.db_models import DatabaseManager
 from data.universe_selector import build_and_cache_dynamic_universe
 from scripts.runtime_common import (
     project_config,
@@ -70,6 +71,11 @@ def main():
     if not errors:
         halted, corp = broker.get_trading_halts_and_corp_actions(symbols)
         save_market_filters(halted, corp)
+        try:
+            db = DatabaseManager()
+            db.record_preflight_success()
+        except Exception:
+            pass
 
     if errors:
         print("PREFLIGHT FAILED")

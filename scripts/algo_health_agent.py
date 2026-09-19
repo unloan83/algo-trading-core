@@ -26,7 +26,7 @@ for env_path in [
 from core.circuit_tracker import CircuitTracker
 from core.entry_models.breakout import evaluate_breakout
 from core.entry_models.trend_pullback import evaluate_trend_pullback
-from core.paper_engine import paper_starting_capital
+from core.paper_engine import paper_starting_capital, paper_gate_status
 from core.screener import Screener
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
@@ -66,9 +66,17 @@ class AlgoHealthAgent:
         self,
         db: Optional[DatabaseManager] = None,
         broker: Optional[UnifiedBrokerClient] = None,
+        starting_capital: Optional[float] = None,
     ):
         self.db = db or DatabaseManager()
         self.broker = broker or UnifiedBrokerClient(paper_mode=True)
+        if starting_capital is not None:
+            self.starting_capital = starting_capital
+        else:
+            try:
+                self.starting_capital = paper_starting_capital()
+            except Exception:
+                self.starting_capital = 30000.0
         self.telegram = TelegramClient()
         self.governor = build_risk_governor()
 
@@ -116,7 +124,7 @@ class AlgoHealthAgent:
 
             positions = self.db.get_open_positions()
 
-            capital = paper_starting_capital()
+            capital = self.starting_capital
             _, equity = self.db.paper_account(capital, positions)
 
             if equity <= 0:
@@ -730,7 +738,9 @@ class AlgoHealthAgent:
         else:
             overall = "🟢 READY"
 
-        capital = paper_starting_capital()
+        capital = self.starting_capital
+        gate = paper_gate_status(self.db)
+        gate_str = "CLEARED 🟢" if gate["gate_cleared"] else f"HOLD ({gate['days_elapsed']}/{gate['days_required']} days, {gate['trades_completed']}/{gate['trades_required']} trades)"
         universe_meta = load_active_universe_metadata()
         universe_count = len(universe_meta.get("selected", []))
 
@@ -743,6 +753,7 @@ class AlgoHealthAgent:
             f"• <b>Mode:</b> PAPER",
             f"• <b>Starting Capital:</b> ₹{capital:,.2f}",
             f"• <b>Dynamic Universe:</b> {universe_count} / NIFTY 200",
+            f"• <b>Paper Gate:</b> {gate_str}",
             "",
         ]
 
@@ -815,6 +826,7 @@ class AlgoHealthAgent:
             f"• Win rate: {cumulative['win_rate_pct']:.1f}%",
             f"• Profit factor: {cumulative['profit_factor']:.2f}",
             f"• Net P&L: ₹{cumulative['net_pnl']:,.2f}",
+            f"• Paper Gate: {'CLEARED 🟢' if paper_gate_status(self.db)['gate_cleared'] else 'HOLD (' + str(paper_gate_status(self.db)['days_elapsed']) + '/' + str(paper_gate_status(self.db)['days_required']) + ' days, ' + str(paper_gate_status(self.db)['trades_completed']) + '/' + str(paper_gate_status(self.db)['trades_required']) + ' trades)'}",
             "",
             "<b>Health Exceptions</b>",
         ]

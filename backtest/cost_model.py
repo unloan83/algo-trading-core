@@ -22,9 +22,11 @@ def calculate_indian_transaction_costs(
     gross_pnl = (sell_price - buy_price) * qty
     slippage_cost = (effective_buy - buy_price) * qty + (sell_price - effective_sell) * qty
 
-    # Brokerage: ₹20 or 0.05% per order
-    brokerage_buy = min(20.0, 0.0005 * turnover_buy)
-    brokerage_sell = min(20.0, 0.0005 * turnover_sell)
+    # Brokerage: Upstox Equity Intraday Plan (Verified live 2026-09-19: lower of ₹20 or 0.05% of turnover per executed order)
+    BROKERAGE_FLAT_INR = 20.0
+    BROKERAGE_PCT = 0.0005  # 0.05%
+    brokerage_buy = min(BROKERAGE_FLAT_INR, BROKERAGE_PCT * turnover_buy)
+    brokerage_sell = min(BROKERAGE_FLAT_INR, BROKERAGE_PCT * turnover_sell)
     total_brokerage = brokerage_buy + brokerage_sell
 
     # STT

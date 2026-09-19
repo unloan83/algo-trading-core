@@ -37,6 +37,23 @@ class TestPaperSafety(unittest.TestCase):
             self.assertTrue(pos.is_intraday)
             self.assertEqual(len(db.get_open_positions()), 1)
 
+    def test_paper_gate_status(self):
+        from core.paper_engine import paper_gate_status
+        from datetime import timedelta
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            db = DatabaseManager(f.name)
+            status = paper_gate_status(db)
+            self.assertFalse(status["gate_cleared"])
+            self.assertEqual(status["days_elapsed"], 0)
+            self.assertEqual(status["trades_completed"], 0)
+
+            # Record preflight passed 50 days ago
+            past = datetime.now() - timedelta(days=50)
+            db.record_preflight_success(past)
+            status = paper_gate_status(db)
+            self.assertEqual(status["days_elapsed"], 50)
+            self.assertFalse(status["gate_cleared"]) # trades_completed still 0 < 20
+
 
 if __name__ == "__main__":
     unittest.main()
