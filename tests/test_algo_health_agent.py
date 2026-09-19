@@ -62,7 +62,8 @@ class TestAlgoHealthAgent(unittest.TestCase):
             "TELEGRAM_CHAT_ID": "123456",
             "TELEGRAM_ALLOWED_USER_ID": "123456",
         }):
-            res = self.agent.check_action_decision_gate()
+            agent = AlgoHealthAgent(db=self.mock_db, broker=self.mock_broker)
+            res = agent.check_action_decision_gate()
             self.assertEqual(res.domain, "ACTION_DECISION_GATE")
             self.assertIn(res.status, ("OK", "WARNING", "BLOCKER"))
             self.assertIn("timeout_seconds", res.details)
