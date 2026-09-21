@@ -16,8 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 for env_path in [
-    Path("/home/user/projects/retained_credentials_and_data/Telegram_Credentials.env"),
-    Path("/home/user/projects/Telegram_Credentials.env"),
+    Path("/home/ubuntu/projects/retained_credentials_and_data/Telegram_Credentials.env"),
+    Path("/home/ubuntu/projects/Telegram_Credentials.env"),
     PROJECT_ROOT / ".env",
 ]:
     if env_path.exists():

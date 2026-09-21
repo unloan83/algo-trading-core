@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 load_dotenv()
 _project_root = Path(__file__).resolve().parents[1]
 for _env_path in [
-    Path("/home/user/projects/retained_credentials_and_data/Telegram_Credentials.env"),
-    Path("/home/user/projects/Telegram_Credentials.env"),
+    Path("/home/ubuntu/projects/retained_credentials_and_data/Telegram_Credentials.env"),
+    Path("/home/ubuntu/projects/Telegram_Credentials.env"),
     _project_root / ".env",
 ]:
     if _env_path.exists():
