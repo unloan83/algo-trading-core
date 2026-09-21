@@ -1,6 +1,7 @@
 import gzip
 import io
 import json
+import logging
 import os
 from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
@@ -18,6 +19,8 @@ load_dotenv(PROJECT_ROOT / ".env", override=False)
 NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 SUSPENDED_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/suspended-instrument.json.gz"
 UPSTOX_BASE = "https://api.upstox.com"
+
+logger = logging.getLogger(__name__)
 
 
 class UnifiedBrokerClient:
@@ -321,6 +324,22 @@ class UnifiedBrokerClient:
                     if str(r.get("trading_symbol", "")).upper() in wanted
                 }
             )
+            MAX_PLAUSIBLE_HALT_RATIO = 0.15  # >15% of a liquid universe halted same-day is not credible
+
+            if wanted and len(halted) / len(wanted) > MAX_PLAUSIBLE_HALT_RATIO:
+                logger.error(
+                    "SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE: %d/%d universe symbols matched as "
+                    "halted (%.0f%%) — treating upstream suspended-instrument data as unreliable, "
+                    "not as %d genuine halts. Sample matched symbols: %s",
+                    len(halted), len(wanted), 100 * len(halted) / len(wanted),
+                    len(halted), sorted(halted)[:10],
+                )
+                raise RuntimeError("SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE")
+        except RuntimeError as exc:
+            if str(exc) == "SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE":
+                raise
+            logger.error("Suspended-instrument lookup failed: %s: %s", type(exc).__name__, exc)
+            halted = []
         except Exception:
             # Do not turn a non-critical suspended-file outage into fake information.
             halted = []

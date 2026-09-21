@@ -1,10 +1,31 @@
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from data.broker_client import UnifiedBrokerClient
 
 
 class TestUnifiedBrokerClient(unittest.TestCase):
+    def test_implausible_suspended_instrument_ratio_raises(self):
+        symbols = [f"SYMBOL{i}" for i in range(20)]
+        suspended = [{"trading_symbol": symbol} for symbol in symbols[:4]]
+        response = MagicMock()
+        response.content = b"mock suspended-instrument response"
+        client = UnifiedBrokerClient()
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            client.cache_dir = cache_dir
+            with patch.object(client.session, "get", return_value=response), patch.object(
+                client,
+                "_decode_gzip_json",
+                return_value=suspended,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE$",
+                ):
+                    client.get_trading_halts_and_corp_actions(symbols)
+
     @patch.object(
         UnifiedBrokerClient,
         "resolve_instrument_key",

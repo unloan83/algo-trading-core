@@ -70,7 +70,15 @@ def main():
                 errors.append(str(exc))
 
     if not errors:
-        halted, corp = broker.get_trading_halts_and_corp_actions(symbols)
+        try:
+            halted, corp = broker.get_trading_halts_and_corp_actions(symbols)
+        except RuntimeError as e:
+            if str(e) == "SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE":
+                print("PREFLIGHT FAILED: suspended-instrument data source returned an implausible "
+                      "halt ratio — see logs for matched symbols. Not proceeding with a corrupted "
+                      "market filter.")
+                sys.exit(1)
+            raise
         save_market_filters(halted, corp)
         try:
             db = DatabaseManager()
