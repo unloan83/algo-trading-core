@@ -172,17 +172,28 @@ class UnifiedBrokerClient:
         interval_minutes: int = 5,
         lookback_days: int = 7,
     ) -> pd.DataFrame:
-        """Historical minute candles including prior sessions; suitable for intraday indicators."""
+        """Prior-session history merged with the current intraday session."""
         if not 1 <= interval_minutes <= 300:
             raise ValueError("interval_minutes must be 1..300")
         key = quote(self.resolve_instrument_key(symbol), safe="")
         to_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         from_date = to_date - timedelta(days=max(2, lookback_days))
-        url = (
+        historical_url = (
             f"{UPSTOX_BASE}/v3/historical-candle/{key}/minutes/{interval_minutes}/"
             f"{to_date.isoformat()}/{from_date.isoformat()}"
         )
-        return self._candles_to_df(self._get_json(url))
+        intraday_url = (
+            f"{UPSTOX_BASE}/v3/historical-candle/intraday/{key}/"
+            f"minutes/{interval_minutes}"
+        )
+        historical = self._candles_to_df(self._get_json(historical_url))
+        intraday = self._candles_to_df(self._get_json(intraday_url))
+        return (
+            pd.concat([historical, intraday], ignore_index=True)
+            .drop_duplicates("timestamp", keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
     def get_ltp(self, symbol: str) -> Optional[float]:
         """
