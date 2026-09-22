@@ -814,6 +814,113 @@ class AlgoHealthAgent:
 
         return ok
 
+    def send_health_heartbeat(
+        self,
+        results: List[HealthCheckResult],
+    ) -> bool:
+        """
+        Send one compact Telegram heartbeat only when every health
+        check in the already-computed results is OK.
+
+        No broker/API health checks are rerun here.
+        """
+        if not results or any(result.status != "OK" for result in results):
+            raise RuntimeError("HEALTH_HEARTBEAT_REQUIRES_ALL_CHECKS_OK")
+
+        by_domain = {result.domain: result for result in results}
+
+        required_domains = {
+            "MODEL_HEALTH",
+            "DATA_INTEGRITY",
+            "RUNTIME_ACTIVITY",
+        }
+        missing = required_domains - set(by_domain)
+
+        if missing:
+            raise RuntimeError(
+                "HEALTH_HEARTBEAT_MISSING_DOMAINS:"
+                + ",".join(sorted(missing))
+            )
+
+        model = by_domain["MODEL_HEALTH"]
+        data = by_domain["DATA_INTEGRITY"]
+        runtime = by_domain["RUNTIME_ACTIVITY"]
+
+        summary = self.today_summary()
+
+        universe_count = model.details.get("active_symbols")
+        latest_candle = data.details.get("latest_candle")
+
+        lines = [
+            "🟢 <b>ALGO SYSTEM — HEALTHY</b>",
+            "",
+            (
+                "• <b>Time:</b> "
+                f"{now_ist_naive().strftime('%Y-%m-%d %H:%M:%S IST')}"
+            ),
+            (
+                "• <b>Market Data:</b> FRESH"
+                + (
+                    f" ({latest_candle})"
+                    if latest_candle is not None
+                    else ""
+                )
+            ),
+            (
+                "• <b>Universe:</b> "
+                f"{universe_count if universe_count is not None else 'NOT_RECORDED'}"
+            ),
+        ]
+
+        marker_labels = (
+            ("preflight", "Preflight"),
+            ("intraday_scan", "Scanner"),
+            ("paper_monitor", "Monitor"),
+        )
+
+        for key, label in marker_labels:
+            marker = runtime.details.get(key)
+
+            if marker:
+                lines.append(
+                    f"• <b>{label}:</b> "
+                    f"{marker.get('status', 'NOT_RECORDED')}"
+                )
+
+        lines.extend(
+            [
+                (
+                    "• <b>Signals Today:</b> "
+                    f"{summary['signals_evaluated_today']}"
+                ),
+                (
+                    "• <b>Open Positions:</b> "
+                    f"{summary['open_positions']}"
+                ),
+                (
+                    "• <b>Net Realized P&L:</b> "
+                    f"₹{summary['net_pnl_today']:,.2f}"
+                ),
+            ]
+        )
+
+        text = "\n".join(lines)
+        print(text)
+
+        if not self.telegram.is_configured():
+            log.error("Telegram not configured for healthy heartbeat")
+            return False
+
+        ok, _, error = self.telegram.send_message(text)
+
+        if not ok:
+            log.error(
+                "Telegram healthy heartbeat failed: %s",
+                error,
+            )
+
+        return ok
+
     def send_issue_alert_if_any(
         self,
         results: Optional[List[HealthCheckResult]] = None,
@@ -897,7 +1004,18 @@ def main():
         if not delivered:
             return args.mode, 1
 
-    if blockers:
+        if blockers:
+            return args.mode, 1
+
+        # WARNING-only execution:
+        # warning alert has already been sent.
+        # Never also send a healthy heartbeat.
+        print("HEALTH CHECK PASSED WITH WARNINGS")
+        return args.mode, 0
+
+    delivered = agent.send_health_heartbeat(results)
+
+    if not delivered:
         return args.mode, 1
 
     print("HEALTH CHECK PASSED")

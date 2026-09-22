@@ -2,6 +2,7 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+import scripts.algo_health_agent as health_module
 from scripts.algo_health_agent import AlgoHealthAgent, HealthCheckResult
 
 
@@ -88,6 +89,160 @@ class TestAlgoHealthAgent(unittest.TestCase):
                 "OCI_RESOURCE_HEALTH",
             ]
             self.assertEqual(domains, expected_domains)
+
+    @patch("scripts.algo_health_agent.AlgoHealthAgent")
+    @patch(
+        "sys.argv",
+        ["algo_health_agent.py", "--mode", "check"],
+    )
+    def test_check_mode_healthy_sends_one_heartbeat(
+        self,
+        mock_agent_cls,
+    ):
+        agent = mock_agent_cls.return_value
+
+        results = [
+            HealthCheckResult(
+                "MODEL_HEALTH",
+                "OK",
+                "model healthy",
+            ),
+            HealthCheckResult(
+                "DATA_INTEGRITY",
+                "OK",
+                "data healthy",
+            ),
+            HealthCheckResult(
+                "RUNTIME_ACTIVITY",
+                "OK",
+                "runtime healthy",
+            ),
+        ]
+
+        agent.run_all_checks.return_value = results
+        agent.send_health_heartbeat.return_value = True
+
+        mode, exit_code = health_module.main()
+
+        self.assertEqual(mode, "check")
+        self.assertEqual(exit_code, 0)
+
+        agent.send_health_heartbeat.assert_called_once_with(results)
+        agent.send_issue_alert_if_any.assert_not_called()
+
+    @patch("scripts.algo_health_agent.AlgoHealthAgent")
+    @patch(
+        "sys.argv",
+        ["algo_health_agent.py", "--mode", "check"],
+    )
+    def test_check_mode_warning_sends_alert_not_heartbeat(
+        self,
+        mock_agent_cls,
+    ):
+        agent = mock_agent_cls.return_value
+
+        results = [
+            HealthCheckResult(
+                "OCI_RESOURCE_HEALTH",
+                "WARNING",
+                "resource warning",
+            ),
+        ]
+
+        agent.run_all_checks.return_value = results
+        agent.send_issue_alert_if_any.return_value = True
+
+        mode, exit_code = health_module.main()
+
+        self.assertEqual(mode, "check")
+        self.assertEqual(exit_code, 0)
+
+        agent.send_issue_alert_if_any.assert_called_once_with(results)
+        agent.send_health_heartbeat.assert_not_called()
+
+    @patch("scripts.algo_health_agent.AlgoHealthAgent")
+    @patch(
+        "sys.argv",
+        ["algo_health_agent.py", "--mode", "check"],
+    )
+    def test_check_mode_blocker_sends_alert_not_heartbeat(
+        self,
+        mock_agent_cls,
+    ):
+        agent = mock_agent_cls.return_value
+
+        results = [
+            HealthCheckResult(
+                "DATA_INTEGRITY",
+                "BLOCKER",
+                "market data stale",
+            ),
+        ]
+
+        agent.run_all_checks.return_value = results
+        agent.send_issue_alert_if_any.return_value = True
+
+        mode, exit_code = health_module.main()
+
+        self.assertEqual(mode, "check")
+        self.assertEqual(exit_code, 1)
+
+        agent.send_issue_alert_if_any.assert_called_once_with(results)
+        agent.send_health_heartbeat.assert_not_called()
+
+    @patch("scripts.algo_health_agent.AlgoHealthAgent")
+    @patch(
+        "sys.argv",
+        ["algo_health_agent.py", "--mode", "check"],
+    )
+    def test_check_mode_heartbeat_delivery_failure_returns_failure(
+        self,
+        mock_agent_cls,
+    ):
+        agent = mock_agent_cls.return_value
+
+        results = [
+            HealthCheckResult(
+                "MODEL_HEALTH",
+                "OK",
+                "model healthy",
+            ),
+            HealthCheckResult(
+                "DATA_INTEGRITY",
+                "OK",
+                "data healthy",
+            ),
+            HealthCheckResult(
+                "RUNTIME_ACTIVITY",
+                "OK",
+                "runtime healthy",
+            ),
+        ]
+
+        agent.run_all_checks.return_value = results
+        agent.send_health_heartbeat.return_value = False
+
+        mode, exit_code = health_module.main()
+
+        self.assertEqual(mode, "check")
+        self.assertEqual(exit_code, 1)
+
+        agent.send_health_heartbeat.assert_called_once_with(results)
+
+    def test_health_heartbeat_rejects_non_ok_results(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "HEALTH_HEARTBEAT_REQUIRES_ALL_CHECKS_OK",
+        ):
+            self.agent.send_health_heartbeat(
+                [
+                    HealthCheckResult(
+                        "DATA_INTEGRITY",
+                        "WARNING",
+                        "warning",
+                    )
+                ]
+            )
 
 
 if __name__ == "__main__":
