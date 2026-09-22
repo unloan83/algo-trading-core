@@ -15,13 +15,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-for env_path in [
-    Path("/home/ubuntu/projects/retained_credentials_and_data/Telegram_Credentials.env"),
-    Path("/home/ubuntu/projects/Telegram_Credentials.env"),
-    PROJECT_ROOT / ".env",
-]:
-    if env_path.exists():
-        load_dotenv(env_path, override=True)
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from core.circuit_tracker import CircuitTracker
 from core.entry_models.breakout import evaluate_breakout
