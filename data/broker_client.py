@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import quote
@@ -310,23 +311,35 @@ class UnifiedBrokerClient:
                             suspended = json.load(f)
                     except Exception:
                         suspended = None
-            if suspended is None:
-                resp = self.session.get(SUSPENDED_INSTRUMENTS_URL, timeout=self.timeout)
-                resp.raise_for_status()
-                suspended = self._decode_gzip_json(resp.content)
-                with open(suspended_cache, "w", encoding="utf-8") as f:
-                    json.dump(suspended, f)
             wanted = {s.upper() for s in symbols}
-            halted = sorted(
-                {
+            MAX_PLAUSIBLE_HALT_RATIO = 0.15  # >15% of a liquid universe halted same-day is not credible
+            NON_TRADABLE_PLACEHOLDER_TYPES = {"BL", "TL", "DL"}
+            for attempt in range(1, 3):
+                fetched = suspended is None
+                if fetched:
+                    resp = self.session.get(SUSPENDED_INSTRUMENTS_URL, timeout=self.timeout)
+                    resp.raise_for_status()
+                    suspended = self._decode_gzip_json(resp.content)
+
+                # A symbol is halted only when every row for it is an
+                # administrative placeholder. Live inspection on 2026-09-22
+                # found 3,578/3,579 placeholder symbols also had a normal row.
+                symbols_with_live_row = {
                     str(r.get("trading_symbol", "")).upper()
                     for r in suspended
-                    if str(r.get("trading_symbol", "")).upper() in wanted
+                    if r.get("instrument_type") not in NON_TRADABLE_PLACEHOLDER_TYPES
                 }
-            )
-            MAX_PLAUSIBLE_HALT_RATIO = 0.15  # >15% of a liquid universe halted same-day is not credible
+                all_symbols_in_feed = {
+                    str(r.get("trading_symbol", "")).upper() for r in suspended
+                }
+                halted = sorted((all_symbols_in_feed - symbols_with_live_row) & wanted)
 
-            if wanted and len(halted) / len(wanted) > MAX_PLAUSIBLE_HALT_RATIO:
+                if not wanted or len(halted) / len(wanted) <= MAX_PLAUSIBLE_HALT_RATIO:
+                    if fetched:
+                        with open(suspended_cache, "w", encoding="utf-8") as f:
+                            json.dump(suspended, f)
+                    break
+
                 logger.error(
                     "SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE: %d/%d universe symbols matched as "
                     "halted (%.0f%%) — treating upstream suspended-instrument data as unreliable, "
@@ -334,7 +347,17 @@ class UnifiedBrokerClient:
                     len(halted), len(wanted), 100 * len(halted) / len(wanted),
                     len(halted), sorted(halted)[:10],
                 )
-                raise RuntimeError("SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE")
+                if attempt == 2:
+                    raise RuntimeError("SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE")
+
+                delay_seconds = 30 * (2 ** (attempt - 1))
+                logger.warning(
+                    "Retrying suspended-instrument feed in %d seconds (attempt %d/2)",
+                    delay_seconds,
+                    attempt + 1,
+                )
+                time.sleep(delay_seconds)
+                suspended = None
         except RuntimeError as exc:
             if str(exc) == "SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE":
                 raise

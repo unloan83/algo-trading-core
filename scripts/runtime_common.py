@@ -43,8 +43,10 @@ def save_market_filters(halted, corporate_actions):
         os.path.join(os.path.dirname(__file__), "..", ".cache", "market_filters.json")
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    now = now_ist_naive()
     payload = {
-        "date": now_ist_naive().date().isoformat(),
+        "date": now.date().isoformat(),
+        "generated_at": now.isoformat(),
         "halted": sorted(set(halted)),
         "corporate_actions": sorted(set(corporate_actions)),
     }

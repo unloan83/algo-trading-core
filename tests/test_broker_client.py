@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -6,9 +7,32 @@ from data.broker_client import UnifiedBrokerClient
 
 
 class TestUnifiedBrokerClient(unittest.TestCase):
-    def test_implausible_suspended_instrument_ratio_raises(self):
-        symbols = [f"SYMBOL{i}" for i in range(20)]
-        suspended = [{"trading_symbol": symbol} for symbol in symbols[:4]]
+    def test_halted_requires_placeholder_only_symbol(self):
+        symbols = [
+            "ADANIENT",
+            "ONLYPLACEHOLDER",
+            *(f"ACTIVE{i}" for i in range(8)),
+        ]
+        suspended = [
+            {
+                "trading_symbol": "ADANIENT",
+                "instrument_type": "BE",
+                "lot_size": 1,
+                "freeze_quantity": 100000,
+            },
+            {
+                "trading_symbol": "ADANIENT",
+                "instrument_type": "BL",
+                "lot_size": 999999999,
+                "freeze_quantity": 999999999,
+            },
+            {
+                "trading_symbol": "ONLYPLACEHOLDER",
+                "instrument_type": "TL",
+                "lot_size": 999999999,
+                "freeze_quantity": 999999999,
+            },
+        ]
         response = MagicMock()
         response.content = b"mock suspended-instrument response"
         client = UnifiedBrokerClient()
@@ -19,12 +43,68 @@ class TestUnifiedBrokerClient(unittest.TestCase):
                 client,
                 "_decode_gzip_json",
                 return_value=suspended,
+            ), patch.object(client, "resolve_instrument", return_value={}):
+                halted, corp_actions = client.get_trading_halts_and_corp_actions(symbols)
+
+        self.assertNotIn("ADANIENT", halted)
+        self.assertEqual(halted, ["ONLYPLACEHOLDER"])
+        self.assertEqual(corp_actions, [])
+
+    @patch("data.broker_client.time.sleep")
+    def test_implausible_suspended_instrument_ratio_retries_once(self, mock_sleep):
+        symbols = [f"SYMBOL{i}" for i in range(20)]
+        first_payload = [
+            {"trading_symbol": symbol, "instrument_type": "BL"}
+            for symbol in symbols
+        ]
+        second_payload = [
+            {"trading_symbol": symbols[0], "instrument_type": "BL"}
+        ]
+        response = MagicMock()
+        response.content = b"mock suspended-instrument response"
+        client = UnifiedBrokerClient()
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            client.cache_dir = cache_dir
+            with open(f"{cache_dir}/upstox_suspended.json", "w", encoding="utf-8") as cache_file:
+                json.dump(first_payload, cache_file)
+            with patch.object(client.session, "get", return_value=response) as mock_get, patch.object(
+                client,
+                "_decode_gzip_json",
+                return_value=second_payload,
+            ), patch.object(client, "resolve_instrument", return_value={}):
+                halted, corp_actions = client.get_trading_halts_and_corp_actions(symbols)
+
+        self.assertEqual(halted, [symbols[0]])
+        self.assertEqual(corp_actions, [])
+        self.assertEqual(mock_get.call_count, 1)
+        mock_sleep.assert_called_once_with(30)
+
+    @patch("data.broker_client.time.sleep")
+    def test_implausible_suspended_instrument_ratio_raises(self, mock_sleep):
+        symbols = [f"SYMBOL{i}" for i in range(20)]
+        suspended = [
+            {"trading_symbol": symbol, "instrument_type": "BL"}
+            for symbol in symbols[:4]
+        ]
+        response = MagicMock()
+        response.content = b"mock suspended-instrument response"
+        client = UnifiedBrokerClient()
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            client.cache_dir = cache_dir
+            with patch.object(client.session, "get", return_value=response) as mock_get, patch.object(
+                client,
+                "_decode_gzip_json",
+                return_value=suspended,
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "^SUSPENDED_INSTRUMENT_DATA_IMPLAUSIBLE$",
                 ):
                     client.get_trading_halts_and_corp_actions(symbols)
+            self.assertEqual(mock_get.call_count, 2)
+            mock_sleep.assert_called_once_with(30)
 
     @patch.object(
         UnifiedBrokerClient,
