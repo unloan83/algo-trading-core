@@ -122,7 +122,13 @@ def main():
         )
 
         if decision["action"] == "APPROVED":
-            pending_id = db.save_pending_signal(sig)
+            pending_id = db.save_pending_signal(
+                sig,
+                auto_executed_on_timeout=decision.get(
+                    "auto_executed_on_timeout",
+                    False,
+                ),
+            )
             approved_count += 1
             log.info(
                 "Approved EOD signal queued for next-session execution: %s (%s)",

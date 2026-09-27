@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
 from core.models import Position, Side, Signal, Order, RegimeType
+from core.time_utils import now_ist_naive
 
 
 class DatabaseManager:
@@ -22,6 +23,8 @@ class DatabaseManager:
         cols = [info[1] for info in cursor.fetchall()]
         if column not in cols:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl};")
+            return True
+        return False
 
     def _init_db(self):
         with self.get_connection() as conn:
@@ -62,6 +65,9 @@ class DatabaseManager:
                 created_at TEXT NOT NULL,
                 broker_order_id TEXT,
                 filled_price REAL,
+                submission_ts TEXT,
+                ack_ts TEXT,
+                fill_ts TEXT,
                 auto_executed_on_timeout INTEGER DEFAULT 0,
                 is_paper INTEGER DEFAULT 1,
                 is_intraday INTEGER DEFAULT 0
@@ -79,6 +85,8 @@ class DatabaseManager:
                 unrealized_pnl REAL DEFAULT 0.0,
                 realized_pnl REAL DEFAULT 0.0,
                 opened_at TEXT NOT NULL,
+                entry_signal_price REAL,
+                auto_executed_on_timeout INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'OPEN',
                 is_paper INTEGER DEFAULT 1,
                 is_intraday INTEGER DEFAULT 0
@@ -134,6 +142,7 @@ class DatabaseManager:
                 rationale TEXT,
                 signal_timestamp TEXT NOT NULL,
                 approved_at TEXT NOT NULL,
+                auto_executed_on_timeout INTEGER DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'PENDING'
             );""")
             c.execute("""
@@ -156,9 +165,51 @@ class DatabaseManager:
                 consumer TEXT PRIMARY KEY,
                 next_offset INTEGER NOT NULL
             );""")
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                equity REAL NOT NULL,
+                trigger TEXT NOT NULL
+            );""")
             self._ensure_column(c, "positions", "status", "TEXT DEFAULT 'OPEN'")
             self._ensure_column(c, "positions", "is_intraday", "INTEGER DEFAULT 0")
             self._ensure_column(c, "orders", "is_intraday", "INTEGER DEFAULT 0")
+            signal_price_added = self._ensure_column(
+                c, "positions", "entry_signal_price", "REAL"
+            )
+            timeout_added = self._ensure_column(
+                c, "positions", "auto_executed_on_timeout", "INTEGER DEFAULT 0"
+            )
+            self._ensure_column(c, "orders", "submission_ts", "TEXT")
+            self._ensure_column(c, "orders", "ack_ts", "TEXT")
+            self._ensure_column(c, "orders", "fill_ts", "TEXT")
+            self._ensure_column(
+                c,
+                "pending_signals",
+                "auto_executed_on_timeout",
+                "INTEGER DEFAULT 0",
+            )
+            if signal_price_added or timeout_added:
+                c.execute("""
+                    UPDATE positions
+                    SET entry_signal_price = COALESCE(
+                            entry_signal_price,
+                            (SELECT entry_price FROM orders
+                             WHERE orders.symbol = positions.symbol
+                               AND orders.created_at = positions.opened_at
+                             LIMIT 1),
+                            entry_price
+                        ),
+                        auto_executed_on_timeout = COALESCE(
+                            (SELECT auto_executed_on_timeout FROM orders
+                             WHERE orders.symbol = positions.symbol
+                               AND orders.created_at = positions.opened_at
+                             LIMIT 1),
+                            auto_executed_on_timeout,
+                            0
+                        )
+                """)
             conn.commit()
 
     def get_open_positions(self) -> List[Position]:
@@ -177,6 +228,12 @@ class DatabaseManager:
                 unrealized_pnl=r["unrealized_pnl"],
                 realized_pnl=r["realized_pnl"],
                 opened_at=datetime.fromisoformat(r["opened_at"]),
+                entry_signal_price=(
+                    float(r["entry_signal_price"])
+                    if r["entry_signal_price"] is not None
+                    else None
+                ),
+                auto_executed_on_timeout=bool(r["auto_executed_on_timeout"]),
                 is_paper=bool(r["is_paper"]),
                 is_intraday=bool(r["is_intraday"]),
             )
@@ -188,7 +245,7 @@ class DatabaseManager:
         signals: List[Signal],
         evaluated_at: Optional[datetime] = None,
     ) -> None:
-        timestamp = (evaluated_at or datetime.now()).isoformat()
+        timestamp = now_ist_naive(evaluated_at).isoformat()
         rows = [
             (
                 f"evaluation_{uuid.uuid4().hex}",
@@ -253,13 +310,17 @@ class DatabaseManager:
                 INSERT INTO orders (
                     order_id, symbol, side, qty, entry_price, stop_price, target_price,
                     status, created_at, broker_order_id, filled_price,
-                    auto_executed_on_timeout, is_paper, is_intraday
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    submission_ts, ack_ts, fill_ts, auto_executed_on_timeout,
+                    is_paper, is_intraday
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """, (
                 order.order_id, order.symbol, order.side.value, order.qty,
                 order.entry_price, order.stop_price, order.target_price,
-                order.status.value, order.created_at.isoformat(),
+                order.status.value, now_ist_naive(order.created_at).isoformat(),
                 order.broker_order_id, order.filled_price,
+                now_ist_naive(order.submission_ts).isoformat(),
+                now_ist_naive(order.ack_ts).isoformat(),
+                now_ist_naive(order.fill_ts).isoformat(),
                 int(order.auto_executed_on_timeout), int(order.is_intraday),
             ))
             position_id = f"pos_{uuid.uuid4().hex[:12]}"
@@ -267,11 +328,14 @@ class DatabaseManager:
             c.execute("""
                 INSERT INTO positions (
                     position_id, symbol, side, qty, entry_price, current_price,
-                    stop_price, target_price, opened_at, status, is_paper, is_intraday
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 1, ?)
+                    stop_price, target_price, opened_at, entry_signal_price,
+                    auto_executed_on_timeout, status, is_paper, is_intraday
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 1, ?)
             """, (
                 position_id, order.symbol, order.side.value, order.qty, fill, fill,
-                order.stop_price, order.target_price, order.created_at.isoformat(),
+                order.stop_price, order.target_price,
+                now_ist_naive(order.created_at).isoformat(),
+                order.entry_price, int(order.auto_executed_on_timeout),
                 int(order.is_intraday),
             ))
             conn.commit()
@@ -285,6 +349,8 @@ class DatabaseManager:
             stop_price=order.stop_price,
             target_price=order.target_price,
             opened_at=order.created_at,
+            entry_signal_price=order.entry_price,
+            auto_executed_on_timeout=order.auto_executed_on_timeout,
             is_paper=True,
             is_intraday=order.is_intraday,
         )
@@ -305,19 +371,27 @@ class DatabaseManager:
             )
             conn.commit()
 
-    def save_pending_signal(self, signal: Signal):
+    def save_pending_signal(
+        self,
+        signal: Signal,
+        *,
+        auto_executed_on_timeout: bool,
+    ):
         pending_id = f"pending_{uuid.uuid4().hex[:12]}"
         with self.get_connection() as conn:
             conn.execute("""
                 INSERT INTO pending_signals (
                     pending_id, symbol, side, entry_price, stop_price, target_price,
-                    model_name, regime, rationale, signal_timestamp, approved_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    model_name, regime, rationale, signal_timestamp, approved_at,
+                    status, auto_executed_on_timeout
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
             """, (
                 pending_id, signal.symbol, signal.side.value, signal.entry_price,
                 signal.stop_price, signal.target_price, signal.model_name,
-                signal.regime.value, signal.rationale, signal.timestamp.isoformat(),
-                datetime.now().isoformat(),
+                signal.regime.value, signal.rationale,
+                now_ist_naive(signal.timestamp).isoformat(),
+                now_ist_naive().isoformat(),
+                int(auto_executed_on_timeout),
             ))
             conn.commit()
         return pending_id
@@ -361,8 +435,9 @@ class DatabaseManager:
         return int(row["n"] or 0)
 
     def increment_consecutive_losses(self, now: Optional[datetime] = None):
-        current_time = (now or datetime.now()).isoformat()
-        today_str = (now or datetime.now()).date().isoformat()
+        current = now_ist_naive(now)
+        current_time = current.isoformat()
+        today_str = current.date().isoformat()
         with self.get_connection() as conn:
             conn.execute("""
                 UPDATE circuit_breaker_state
@@ -372,7 +447,7 @@ class DatabaseManager:
             conn.commit()
 
     def reset_consecutive_losses(self, now: Optional[datetime] = None):
-        today_str = (now or datetime.now()).date().isoformat()
+        today_str = now_ist_naive(now).date().isoformat()
         with self.get_connection() as conn:
             conn.execute(
                 "UPDATE circuit_breaker_state SET consecutive_losses=0 WHERE date=?",
@@ -388,7 +463,7 @@ class DatabaseManager:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 symbol, side, entry_price, stop_price, reason_code,
-                datetime.now().isoformat(),
+                now_ist_naive().isoformat(),
             ))
             conn.commit()
 
@@ -397,7 +472,7 @@ class DatabaseManager:
             conn.execute("""
                 INSERT INTO regime_log (regime, rationale, timestamp)
                 VALUES (?, ?, ?)
-            """, (regime, rationale, datetime.now().isoformat()))
+            """, (regime, rationale, now_ist_naive().isoformat()))
             conn.commit()
 
     def get_latest_regime(self, date_iso: str) -> Optional[Dict[str, Any]]:
@@ -465,7 +540,7 @@ class DatabaseManager:
         }
 
     def record_preflight_success(self, timestamp: Optional[datetime] = None):
-        ts = (timestamp or datetime.now()).isoformat()
+        ts = now_ist_naive(timestamp).isoformat()
         with self.get_connection() as conn:
             conn.execute(
                 "INSERT INTO system_events (event_type, details, timestamp) VALUES (?, ?, ?)",
@@ -540,10 +615,22 @@ class DatabaseManager:
                     int(update_id),
                     str(action).upper(),
                     signal_id,
-                    datetime.now().isoformat(),
+                    now_ist_naive().isoformat(),
                 ),
             )
             conn.commit()
+
+    def record_equity_snapshot(self, equity: float, trigger: str) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO equity_snapshots (timestamp, equity, trigger)
+                VALUES (?, ?, ?)
+                """,
+                (now_ist_naive().isoformat(), float(equity), str(trigger)),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
 
     def pop_telegram_callback(
         self,

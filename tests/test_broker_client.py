@@ -7,27 +7,30 @@ from data.broker_client import UnifiedBrokerClient
 
 
 class TestUnifiedBrokerClient(unittest.TestCase):
-    def test_halted_requires_placeholder_only_symbol(self):
+    def test_halted_parser_accepts_real_halt_and_excludes_placeholder(self):
         symbols = [
-            "ADANIENT",
-            "ONLYPLACEHOLDER",
+            "REALHALT",
+            "PLACEHOLDER",
             *(f"ACTIVE{i}" for i in range(8)),
         ]
         suspended = [
             {
-                "trading_symbol": "ADANIENT",
-                "instrument_type": "BE",
+                "trading_symbol": "REALHALT",
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
                 "lot_size": 1,
                 "freeze_quantity": 100000,
             },
             {
-                "trading_symbol": "ADANIENT",
+                "trading_symbol": "PLACEHOLDER",
+                "segment": "NSE_EQ",
                 "instrument_type": "BL",
                 "lot_size": 999999999,
                 "freeze_quantity": 999999999,
             },
             {
-                "trading_symbol": "ONLYPLACEHOLDER",
+                "trading_symbol": "PLACEHOLDER",
+                "segment": "NSE_EQ",
                 "instrument_type": "TL",
                 "lot_size": 999999999,
                 "freeze_quantity": 999999999,
@@ -46,19 +49,26 @@ class TestUnifiedBrokerClient(unittest.TestCase):
             ), patch.object(client, "resolve_instrument", return_value={}):
                 halted, corp_actions = client.get_trading_halts_and_corp_actions(symbols)
 
-        self.assertNotIn("ADANIENT", halted)
-        self.assertEqual(halted, ["ONLYPLACEHOLDER"])
+        self.assertEqual(halted, ["REALHALT"])
         self.assertEqual(corp_actions, [])
 
     @patch("data.broker_client.time.sleep")
     def test_implausible_suspended_instrument_ratio_retries_once(self, mock_sleep):
         symbols = [f"SYMBOL{i}" for i in range(20)]
         first_payload = [
-            {"trading_symbol": symbol, "instrument_type": "BL"}
+            {
+                "trading_symbol": symbol,
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
+            }
             for symbol in symbols
         ]
         second_payload = [
-            {"trading_symbol": symbols[0], "instrument_type": "BL"}
+            {
+                "trading_symbol": symbols[0],
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
+            }
         ]
         response = MagicMock()
         response.content = b"mock suspended-instrument response"
@@ -84,7 +94,11 @@ class TestUnifiedBrokerClient(unittest.TestCase):
     def test_implausible_suspended_instrument_ratio_raises(self, mock_sleep):
         symbols = [f"SYMBOL{i}" for i in range(20)]
         suspended = [
-            {"trading_symbol": symbol, "instrument_type": "BL"}
+            {
+                "trading_symbol": symbol,
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
+            }
             for symbol in symbols[:4]
         ]
         response = MagicMock()

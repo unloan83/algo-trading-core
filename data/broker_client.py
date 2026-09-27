@@ -74,6 +74,24 @@ class UnifiedBrokerClient:
         except OSError:
             return json.loads(content.decode("utf-8"))
 
+    @staticmethod
+    def _halted_symbols_from_suspended_feed(
+        rows: List[Dict[str, Any]],
+        wanted: set[str],
+    ) -> List[str]:
+        # The verified feed has no separate halt-status field. Only its canonical
+        # NSE cash-equity enum represents a halted primary listing; BL/TL/DL and
+        # other series are administrative or alternate instrument rows.
+        return sorted(
+            {
+                str(row.get("trading_symbol", "")).upper()
+                for row in rows
+                if row.get("segment") == "NSE_EQ"
+                and row.get("instrument_type") == "EQ"
+            }
+            & wanted
+        )
+
     def _load_instruments(self) -> None:
         if self._instrument_records is not None:
             return
@@ -313,7 +331,6 @@ class UnifiedBrokerClient:
                         suspended = None
             wanted = {s.upper() for s in symbols}
             MAX_PLAUSIBLE_HALT_RATIO = 0.15  # >15% of a liquid universe halted same-day is not credible
-            NON_TRADABLE_PLACEHOLDER_TYPES = {"BL", "TL", "DL"}
             for attempt in range(1, 3):
                 fetched = suspended is None
                 if fetched:
@@ -321,18 +338,10 @@ class UnifiedBrokerClient:
                     resp.raise_for_status()
                     suspended = self._decode_gzip_json(resp.content)
 
-                # A symbol is halted only when every row for it is an
-                # administrative placeholder. Live inspection on 2026-09-22
-                # found 3,578/3,579 placeholder symbols also had a normal row.
-                symbols_with_live_row = {
-                    str(r.get("trading_symbol", "")).upper()
-                    for r in suspended
-                    if r.get("instrument_type") not in NON_TRADABLE_PLACEHOLDER_TYPES
-                }
-                all_symbols_in_feed = {
-                    str(r.get("trading_symbol", "")).upper() for r in suspended
-                }
-                halted = sorted((all_symbols_in_feed - symbols_with_live_row) & wanted)
+                halted = self._halted_symbols_from_suspended_feed(
+                    suspended,
+                    wanted,
+                )
 
                 if not wanted or len(halted) / len(wanted) <= MAX_PLAUSIBLE_HALT_RATIO:
                     if fetched:

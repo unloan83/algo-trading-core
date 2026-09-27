@@ -1,8 +1,8 @@
 import os
 import uuid
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import timedelta
 from core.models import Signal, Order, OrderStatus, Side
+from core.time_utils import now_ist_naive
 
 
 class PaperBrokerSimulator:
@@ -21,6 +21,10 @@ class PaperBrokerSimulator:
         else:
             fill_price = signal.entry_price * (1.0 - self.slippage_pct / 100.0)
 
+        submission_ts = now_ist_naive()
+        ack_ts = max(now_ist_naive(), submission_ts + timedelta(microseconds=1))
+        fill_ts = max(now_ist_naive(), ack_ts + timedelta(microseconds=1))
+
         return Order(
             order_id=f"paper_{uuid.uuid4().hex[:10]}",
             symbol=signal.symbol,
@@ -30,7 +34,10 @@ class PaperBrokerSimulator:
             stop_price=signal.stop_price,
             target_price=signal.target_price,
             status=OrderStatus.FILLED,
-            created_at=datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None),
+            created_at=submission_ts,
+            submission_ts=submission_ts,
+            ack_ts=ack_ts,
+            fill_ts=fill_ts,
             broker_order_id=f"sim_{uuid.uuid4().hex[:8]}",
             filled_price=fill_price,
             auto_executed_on_timeout=auto_executed_on_timeout,

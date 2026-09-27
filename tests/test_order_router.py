@@ -17,6 +17,9 @@ class TestOrderRouter(unittest.TestCase):
         self.assertTrue(order.is_paper)
         self.assertTrue(order.auto_executed_on_timeout)
         self.assertAlmostEqual(order.filled_price, 1501.5, places=3)
+        self.assertEqual(order.created_at, order.submission_ts)
+        self.assertLess(order.submission_ts, order.ack_ts)
+        self.assertLess(order.ack_ts, order.fill_ts)
 
 if __name__ == "__main__":
     unittest.main()

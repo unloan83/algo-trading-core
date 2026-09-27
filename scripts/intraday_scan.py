@@ -124,7 +124,7 @@ def main():
             continue
         pos = execute_paper_signal(
             db, router, sig, risk.computed_qty,
-            auto_executed_on_timeout=True,
+            auto_executed_on_timeout=bool(row["auto_executed_on_timeout"]),
             is_intraday=False,
         )
         db.mark_pending_signal(row["pending_id"], "EXECUTED")

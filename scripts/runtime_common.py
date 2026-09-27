@@ -3,17 +3,12 @@ import os
 import yaml
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from core.risk_governor import RiskGovernor
+from core.time_utils import now_ist_naive
 
-IST = ZoneInfo("Asia/Kolkata")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_MARKER_DIR = PROJECT_ROOT / ".cache" / "runtime"
-
-
-def now_ist_naive() -> datetime:
-    return datetime.now(IST).replace(tzinfo=None)
 
 
 def project_config(filename: str):

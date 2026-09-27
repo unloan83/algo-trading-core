@@ -7,6 +7,7 @@ from datetime import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core.models import Side
+from core.paper_engine import paper_starting_capital
 from core.order_router import OrderRouter
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
@@ -34,9 +35,12 @@ def main():
         return
 
     db = DatabaseManager()
+    capital = paper_starting_capital()
     positions = db.get_open_positions()
 
     if not positions:
+        _, equity = db.paper_account(capital, positions)
+        db.record_equity_snapshot(equity, "PAPER_MONITOR")
         write_runtime_marker(
             "paper_monitor",
             "SUCCESS",
@@ -98,6 +102,9 @@ def main():
             entry_time=pos.opened_at,
             exit_time=now,
             exit_reason=reason,
+            entry_signal_price=pos.entry_signal_price,
+            exit_signal_price=ltp,
+            auto_executed_on_timeout=pos.auto_executed_on_timeout,
             is_paper=True,
             is_intraday=pos.is_intraday,
             slippage_already_applied=True,
@@ -114,6 +121,9 @@ def main():
         )
         closed_count += 1
         log.info("Closed PAPER position %s: %s, net %.2f", pos.symbol, reason, net_pnl)
+
+    _, equity = db.paper_account(capital, db.get_open_positions())
+    db.record_equity_snapshot(equity, "PAPER_MONITOR")
 
     write_runtime_marker(
         "paper_monitor",

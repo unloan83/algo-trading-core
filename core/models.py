@@ -100,6 +100,9 @@ class Order(BaseModel):
     target_price: float = Field(gt=0)
     status: OrderStatus = OrderStatus.CREATED
     created_at: datetime
+    submission_ts: datetime
+    ack_ts: datetime
+    fill_ts: datetime
     broker_order_id: Optional[str] = None
     filled_price: Optional[float] = None
     auto_executed_on_timeout: bool = False
@@ -119,5 +122,7 @@ class Position(BaseModel):
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     opened_at: datetime
+    entry_signal_price: Optional[float] = None
+    auto_executed_on_timeout: bool = False
     is_paper: bool = True
     is_intraday: bool = False
