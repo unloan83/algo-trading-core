@@ -68,10 +68,7 @@ class AlgoHealthAgent:
         if starting_capital is not None:
             self.starting_capital = starting_capital
         else:
-            try:
-                self.starting_capital = paper_starting_capital()
-            except Exception:
-                self.starting_capital = 30000.0
+            self.starting_capital = paper_starting_capital()
         self.telegram = TelegramClient()
         self.governor = build_risk_governor()
 

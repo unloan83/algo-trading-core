@@ -139,6 +139,7 @@ class RiskGovernor:
             entry_price=signal.entry_price,
             stop_price=signal.stop_price,
             open_positions=open_positions,
+            max_concurrent_positions=self.max_positions,
             risk_per_trade_pct=self.risk_per_trade_pct,
             max_open_risk_pct=self.max_open_risk_pct
         )

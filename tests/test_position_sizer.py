@@ -5,17 +5,22 @@ from core.models import Position, Side
 
 class TestPositionSizer(unittest.TestCase):
     def test_position_size_normal_buy(self):
-        res = calculate_position_size(
-            equity_now=100000.0,
-            available_cash=500000.0,
-            entry_price=100.0,
-            stop_price=95.0,
-            open_positions=[],
-            risk_per_trade_pct=0.5
-        )
+        with self.assertLogs("core.position_sizer", level="INFO") as logs:
+            res = calculate_position_size(
+                equity_now=100000.0,
+                available_cash=500000.0,
+                entry_price=100.0,
+                stop_price=95.0,
+                open_positions=[],
+                max_concurrent_positions=4,
+                risk_per_trade_pct=0.5
+            )
         self.assertTrue(res.passed)
         self.assertEqual(res.computed_qty, 100)
         self.assertEqual(res.rupee_risk, 500.0)
+        self.assertIn("risk_qty=100.000000", logs.output[0])
+        self.assertIn("capital_qty=1250.000000", logs.output[0])
+        self.assertIn("binding_constraint=risk_qty", logs.output[0])
 
     def test_position_size_zero_stop_dist(self):
         res = calculate_position_size(
@@ -23,7 +28,8 @@ class TestPositionSizer(unittest.TestCase):
             available_cash=500000.0,
             entry_price=100.0,
             stop_price=100.0,
-            open_positions=[]
+            open_positions=[],
+            max_concurrent_positions=4
         )
         self.assertFalse(res.passed)
         self.assertEqual(res.reason_code, "ZERO_STOP_DISTANCE")
@@ -36,24 +42,30 @@ class TestPositionSizer(unittest.TestCase):
             entry_price=500.0,
             stop_price=480.0,
             open_positions=[],
+            max_concurrent_positions=4,
             risk_per_trade_pct=0.5
         )
         self.assertFalse(res.passed)
         self.assertEqual(res.reason_code, "RISK_BUDGET_TOO_SMALL")
         self.assertEqual(res.computed_qty, 0)
 
-    def test_position_size_insufficient_cash_hard_reject(self):
-        res = calculate_position_size(
-            equity_now=100000.0,
-            available_cash=1000.0, # Cash only ₹1,000, buy 100 shares @ ₹100 needs ₹10,000
-            entry_price=100.0,
-            stop_price=95.0,
-            open_positions=[],
-            risk_per_trade_pct=0.5
-        )
-        self.assertFalse(res.passed)
-        self.assertEqual(res.reason_code, "INSUFFICIENT_CASH_FOR_FULL_SIZE")
-        self.assertEqual(res.computed_qty, 0)
+    def test_position_size_capital_constraint_scales_quantity(self):
+        with self.assertLogs("core.position_sizer", level="INFO") as logs:
+            res = calculate_position_size(
+                equity_now=100000.0,
+                available_cash=10000.0,
+                entry_price=100.0,
+                stop_price=95.0,
+                open_positions=[],
+                max_concurrent_positions=4,
+                risk_per_trade_pct=0.5
+            )
+        self.assertTrue(res.passed)
+        self.assertEqual(res.computed_qty, 25)
+        self.assertEqual(res.rupee_risk, 125.0)
+        self.assertIn("risk_qty=100.000000", logs.output[0])
+        self.assertIn("capital_qty=25.000000", logs.output[0])
+        self.assertIn("binding_constraint=capital_qty", logs.output[0])
 
     def test_position_size_open_risk_exceeded(self):
         pos1 = Position(
@@ -66,6 +78,7 @@ class TestPositionSizer(unittest.TestCase):
             entry_price=200.0,
             stop_price=190.0,
             open_positions=[pos1],
+            max_concurrent_positions=4,
             max_open_risk_pct=1.5
         )
         self.assertFalse(res.passed)
@@ -77,7 +90,8 @@ class TestPositionSizer(unittest.TestCase):
             available_cash=1000.0,
             entry_price=100.0,
             stop_price=95.0,
-            open_positions=[]
+            open_positions=[],
+            max_concurrent_positions=4
         )
         self.assertFalse(res.passed)
         self.assertEqual(res.reason_code, "EQUITY_ZERO_OR_NEGATIVE")

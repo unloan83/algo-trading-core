@@ -10,7 +10,11 @@ class TestAlgoHealthAgent(unittest.TestCase):
     def setUp(self):
         self.mock_db = MagicMock()
         self.mock_broker = MagicMock()
-        self.agent = AlgoHealthAgent(db=self.mock_db, broker=self.mock_broker)
+        self.agent = AlgoHealthAgent(
+            db=self.mock_db,
+            broker=self.mock_broker,
+            starting_capital=100000.0,
+        )
 
     @patch.object(AlgoHealthAgent, "_active_symbols", return_value=["INFY"])
     def test_check_model_health(self, _mock_symbols):
@@ -23,7 +27,7 @@ class TestAlgoHealthAgent(unittest.TestCase):
     def test_check_system_blockers_clear(self, mock_tracker_cls):
         mock_tracker = mock_tracker_cls.return_value
         mock_tracker.compute_mark_to_market_pnl.return_value = (0.0, 0.0, 0.0)
-        self.mock_db.paper_account.return_value = (30000.0, 30000.0)
+        self.mock_db.paper_account.return_value = (100000.0, 100000.0)
         self.mock_db.get_latest_circuit_state.return_value = {"consecutive_losses": 0, "last_loss_time": None}
         self.mock_db.get_open_positions.return_value = []
 
@@ -35,7 +39,7 @@ class TestAlgoHealthAgent(unittest.TestCase):
     def test_check_system_blockers_tripped(self, mock_tracker_cls):
         mock_tracker = mock_tracker_cls.return_value
         mock_tracker.compute_mark_to_market_pnl.return_value = (-5000.0, 0.0, 0.0)
-        self.mock_db.paper_account.return_value = (30000.0, 30000.0)
+        self.mock_db.paper_account.return_value = (100000.0, 100000.0)
         self.mock_db.get_latest_circuit_state.return_value = {"consecutive_losses": 3, "last_loss_time": None}
         self.mock_db.get_open_positions.return_value = []
 
@@ -63,7 +67,11 @@ class TestAlgoHealthAgent(unittest.TestCase):
             "TELEGRAM_CHAT_ID": "123456",
             "TELEGRAM_ALLOWED_USER_ID": "123456",
         }):
-            agent = AlgoHealthAgent(db=self.mock_db, broker=self.mock_broker)
+            agent = AlgoHealthAgent(
+                db=self.mock_db,
+                broker=self.mock_broker,
+                starting_capital=100000.0,
+            )
             res = agent.check_action_decision_gate()
             self.assertEqual(res.domain, "ACTION_DECISION_GATE")
             self.assertIn(res.status, ("OK", "WARNING", "BLOCKER"))
@@ -71,9 +79,9 @@ class TestAlgoHealthAgent(unittest.TestCase):
 
     @patch.object(AlgoHealthAgent, "_active_symbols", return_value=["INFY"])
     def test_run_all_checks_returns_eight_domains(self, _mock_symbols):
-        with patch.dict(os.environ, {"UPSTOX_ANALYTICS_TOKEN": "mock_token", "PAPER_STARTING_CAPITAL": "30000"}):
+        with patch.dict(os.environ, {"UPSTOX_ANALYTICS_TOKEN": "mock_token", "PAPER_STARTING_CAPITAL": "100000"}):
             self.mock_broker.validate_readonly_access.return_value = (True, "Token valid")
-            self.mock_db.paper_account.return_value = (30000.0, 30000.0)
+            self.mock_db.paper_account.return_value = (100000.0, 100000.0)
             results = self.agent.run_all_checks()
 
             self.assertEqual(len(results), 8)
