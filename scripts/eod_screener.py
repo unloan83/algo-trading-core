@@ -49,6 +49,24 @@ def _finish_scan(db_path: str = "trading_system.db", exc: BaseException = None):
     _active_scan_run = None
 
 
+def _safe_eod_marker(status: str, message: str) -> None:
+    try:
+        write_runtime_marker("eod_screener", status, message)
+    except Exception as exc:
+        log.error("EOD_MARKER_WRITE_FAILED:%s:%s", type(exc).__name__, exc)
+
+
+def _best_effort_degraded_alert(reason: str) -> None:
+    try:
+        delivered, _message_id, detail = TelegramClient().send_message(
+            f"EOD input DEGRADED: {reason[:350]}"
+        )
+        if not delivered:
+            log.error("EOD_DEGRADED_ALERT_FAILED:RuntimeError:%s", detail)
+    except Exception as exc:
+        log.error("EOD_DEGRADED_ALERT_FAILED:%s:%s", type(exc).__name__, exc)
+
+
 def main():
     global _active_scan_run
     now = now_ist_naive()
@@ -59,9 +77,12 @@ def main():
     ok, msg = broker.validate_readonly_access()
     if not ok:
         raise SystemExit(msg)
-    if not broker.is_nse_trading_day(now.date()):
+    is_trading_session = broker.is_nse_trading_day(now.date())
+    if not is_trading_session:
         log.info("NSE not trading today; EOD scan skipped.")
-        write_runtime_marker("eod_screener", "SKIPPED", "NSE not trading today")
+        reason = "input_asof_stale=1 reason=NOT_NSE_TRADING_SESSION"
+        _safe_eod_marker("DEGRADED", reason)
+        _best_effort_degraded_alert(reason)
         _active_scan_run.status = "SKIPPED"
         _finish_scan(db.db_path)
         return
@@ -69,13 +90,30 @@ def main():
     universe_cfg = project_config("universe.yaml")["universe"]
     symbols = load_active_universe(universe_cfg)
 
-    nifty_df = broker.get_historical_data("NIFTY 50", days=210)
+    nifty_result = broker.get_eod_historical_data(
+        "NIFTY 50",
+        days=210,
+        now_ist=now,
+        is_trading_session=is_trading_session,
+    )
+    nifty_df = nifty_result.candles
     if len(nifty_df) < 200:
         raise SystemExit(f"INSUFFICIENT_NIFTY_DAILY_DATA:{len(nifty_df)}")
 
     symbol_data = {}
+    degraded_inputs = []
+    if nifty_result.input_asof_stale:
+        degraded_inputs.append(f"NIFTY 50:{nifty_result.reason}")
     for symbol in symbols:
-        df = broker.get_historical_data(symbol, days=210)
+        result = broker.get_eod_historical_data(
+            symbol,
+            days=210,
+            now_ist=now,
+            is_trading_session=is_trading_session,
+        )
+        df = result.candles
+        if result.input_asof_stale:
+            degraded_inputs.append(f"{symbol}:{result.reason}")
         if len(df) >= 25:
             symbol_data[symbol] = df
 
@@ -87,7 +125,7 @@ def main():
         observed_at=now,
         input_asof_date=input_asof.isoformat(),
         input_candle_count=len(nifty_df),
-        input_asof_stale=input_asof != now.date(),
+        input_asof_stale=nifty_result.input_asof_stale,
         source_mode="eod",
         input_symbol="NIFTY 50",
         input_timeframe="1day",
@@ -210,14 +248,19 @@ def main():
         else:
             _active_scan_run.skip("approval")
 
-    write_runtime_marker(
-        "eod_screener",
-        "SUCCESS",
-        (
-            f"universe={len(symbols)} data_ready={len(symbol_data)} "
-            f"signals={len(signals)} approved={approved_count}"
-        ),
+    summary = (
+        f"universe={len(symbols)} data_ready={len(symbol_data)} "
+        f"signals={len(signals)} approved={approved_count}"
     )
+    if degraded_inputs:
+        reason = ";".join(degraded_inputs)
+        _safe_eod_marker(
+            "DEGRADED",
+            f"input_asof_stale=1 {summary} reason={reason}",
+        )
+        _best_effort_degraded_alert(reason)
+    else:
+        _safe_eod_marker("SUCCESS", f"input_asof_stale=0 {summary}")
     _finish_scan(db.db_path)
 
 
@@ -226,9 +269,5 @@ if __name__ == "__main__":
         main()
     except BaseException as exc:
         _finish_scan(exc=exc)
-        write_runtime_marker(
-            "eod_screener",
-            "FAILED",
-            f"{type(exc).__name__}:{exc}",
-        )
+        _safe_eod_marker("FAILED", f"{type(exc).__name__}:{exc}")
         raise

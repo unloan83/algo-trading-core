@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import quote
@@ -22,6 +23,14 @@ SUSPENDED_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/
 UPSTOX_BASE = "https://api.upstox.com"
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EODHistoryResult:
+    candles: pd.DataFrame
+    input_asof_stale: bool
+    assembled_current_session: bool
+    reason: str
 
 
 class UnifiedBrokerClient:
@@ -187,6 +196,137 @@ class UnifiedBrokerClient:
         )
         df = self._candles_to_df(self._get_json(url))
         return df.tail(days).reset_index(drop=True)
+
+    def get_current_intraday_session(
+        self,
+        symbol: str,
+        interval_minutes: int = 5,
+    ) -> pd.DataFrame:
+        """Current-session candles from Upstox's dedicated intraday endpoint."""
+        if not 1 <= interval_minutes <= 300:
+            raise ValueError("interval_minutes must be 1..300")
+        key = quote(self.resolve_instrument_key(symbol), safe="")
+        url = (
+            f"{UPSTOX_BASE}/v3/historical-candle/intraday/{key}/"
+            f"minutes/{interval_minutes}"
+        )
+        return self._candles_to_df(self._get_json(url))
+
+    @staticmethod
+    def _merge_daily_candle(
+        historical: pd.DataFrame,
+        candle: Dict[str, Any],
+        days: int,
+    ) -> pd.DataFrame:
+        combined = pd.concat(
+            [historical, pd.DataFrame([candle])],
+            ignore_index=True,
+        )
+        combined["_session_date"] = pd.to_datetime(combined["timestamp"]).dt.date
+        return (
+            combined.sort_values("timestamp", kind="stable")
+            .drop_duplicates("_session_date", keep="last")
+            .drop(columns="_session_date")
+            .tail(days)
+            .reset_index(drop=True)
+        )
+
+    def get_eod_historical_data(
+        self,
+        symbol: str,
+        days: int = 210,
+        *,
+        now_ist: Optional[datetime] = None,
+        is_trading_session: bool,
+    ) -> EODHistoryResult:
+        """Return daily history with a validated just-completed session when available."""
+        historical = self.get_historical_data(symbol, days=days)
+        now = now_ist or datetime.now(ZoneInfo("Asia/Kolkata"))
+        if now.tzinfo is not None:
+            now = now.astimezone(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+        def fallback(reason: str) -> EODHistoryResult:
+            return EODHistoryResult(
+                candles=historical,
+                input_asof_stale=True,
+                assembled_current_session=False,
+                reason=reason,
+            )
+
+        if not is_trading_session:
+            return fallback("NOT_NSE_TRADING_SESSION")
+        if now.time() < datetime.strptime("15:35", "%H:%M").time():
+            return fallback("BEFORE_EOD_ASSEMBLY_WINDOW")
+
+        try:
+            intraday = self.get_current_intraday_session(symbol, interval_minutes=5)
+            session = intraday[
+                pd.to_datetime(intraday["timestamp"]).dt.date == now.date()
+            ].copy()
+            session = session.sort_values("timestamp").drop_duplicates("timestamp")
+            expected = pd.date_range(
+                f"{now.date().isoformat()} 09:15:00",
+                f"{now.date().isoformat()} 15:25:00",
+                freq="5min",
+            )
+            actual = pd.DatetimeIndex(pd.to_datetime(session["timestamp"]))
+            if not actual.equals(expected):
+                return fallback(
+                    f"INCOMPLETE_INTRADAY_SESSION:{len(actual)}/{len(expected)}"
+                )
+
+            numeric_columns = ["open", "high", "low", "close", "volume"]
+            if session[numeric_columns].isna().any().any():
+                return fallback("INVALID_INTRADAY_NULL_VALUE")
+            if not (
+                (session["open"] > 0)
+                & (session["high"] > 0)
+                & (session["low"] > 0)
+                & (session["close"] > 0)
+                & (session["low"] <= session["open"])
+                & (session["open"] <= session["high"])
+                & (session["low"] <= session["close"])
+                & (session["close"] <= session["high"])
+                & (session["volume"] >= 0)
+            ).all():
+                return fallback("INVALID_INTRADAY_OHLCV")
+
+            total_volume = int(session["volume"].sum())
+            instrument_type = str(
+                self.resolve_instrument(symbol).get("instrument_type", "")
+            ).upper()
+            if instrument_type != "INDEX" and total_volume <= 0:
+                return fallback("INVALID_EQUITY_SESSION_VOLUME")
+
+            candle = {
+                "timestamp": pd.Timestamp(now.date()),
+                "open": float(session.iloc[0]["open"]),
+                "high": float(session["high"].max()),
+                "low": float(session["low"].min()),
+                "close": float(session.iloc[-1]["close"]),
+                "volume": total_volume,
+            }
+            merged = self._merge_daily_candle(historical, candle, days)
+            final_date = pd.to_datetime(merged.iloc[-1]["timestamp"]).date()
+            if final_date != now.date():
+                raise AssertionError(
+                    "EOD_INPUT_ASOF_MISMATCH:"
+                    f"expected={now.date().isoformat()}:actual={final_date.isoformat()}"
+                )
+            return EODHistoryResult(
+                candles=merged,
+                input_asof_stale=False,
+                assembled_current_session=True,
+                reason="CURRENT_SESSION_ASSEMBLED",
+            )
+        except Exception as exc:
+            logger.error(
+                "EOD_INTRADAY_ASSEMBLY_FAILED:%s:%s:%s",
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            return fallback(f"INTRADAY_ENDPOINT_OR_ASSEMBLY_ERROR:{type(exc).__name__}")
 
     def get_intraday_history(
         self,
