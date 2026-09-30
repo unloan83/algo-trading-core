@@ -17,6 +17,12 @@ from core.screener import Screener
 from core.order_router import OrderRouter
 from data.broker_client import UnifiedBrokerClient
 from data.db_models import DatabaseManager
+from data.observability import (
+    feature_snapshot,
+    new_scan_run,
+    safe_record_scan_run,
+    safe_set_signal_block_reason,
+)
 from data.universe_selector import load_active_universe
 from scripts.runtime_common import (
     build_risk_governor,
@@ -30,6 +36,20 @@ from telegram_bot.telegram_client import TelegramClient
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("intraday_scan")
+_active_scan_run = None
+
+
+def _finish_scan(db_path: str = "trading_system.db", exc: BaseException = None):
+    global _active_scan_run
+    run = _active_scan_run
+    if run is None:
+        return
+    if exc is not None:
+        run.fail(exc)
+    elif run.status == "RUNNING":
+        run.status = "SUCCESS"
+    safe_record_scan_run(db_path, run)
+    _active_scan_run = None
 
 
 def _parse_hhmm(value: str) -> time:
@@ -59,6 +79,7 @@ def _risk_check(governor, sig, account, positions, pnl, halted, corp, now, candl
 
 
 def main():
+    global _active_scan_run
     now = now_ist_naive()
     timing = project_config("timing.yaml")["timing"]["intraday_scan"]
     start = _parse_hhmm(timing["entry_window_start"])
@@ -66,12 +87,16 @@ def main():
     if not (start <= now.time() <= end):
         return
 
+    _active_scan_run = new_scan_run("intraday", now)
+
     broker = UnifiedBrokerClient(paper_mode=True)
     ok, msg = broker.validate_readonly_access()
     if not ok:
         raise SystemExit(msg)
     if not broker.is_nse_trading_day(now.date()):
         write_runtime_marker("intraday_scan", "SKIPPED", "NSE not trading today")
+        _active_scan_run.status = "SKIPPED"
+        _finish_scan()
         return
 
     db = DatabaseManager()
@@ -138,7 +163,17 @@ def main():
     if len(nifty) < 50:
         raise RuntimeError(f"INSUFFICIENT_5MIN_NIFTY_HISTORY:{len(nifty)}")
     regime, rationale = evaluate_regime(nifty)
-    db.record_regime(regime.value, f"intraday:{rationale}")
+    db.record_regime(
+        regime.value,
+        f"intraday:{rationale}",
+        observed_at=now,
+        input_asof_date=nifty.iloc[-1]["timestamp"].date().isoformat(),
+        input_candle_count=len(nifty),
+        input_asof_stale=False,
+        source_mode="intraday",
+        input_symbol="NIFTY 50",
+        input_timeframe="5minute",
+    )
 
     symbol_data = {}
     for symbol in symbols:
@@ -148,13 +183,32 @@ def main():
             symbol_data[symbol] = df
 
     signals = Screener(symbols).run_intraday_scan(symbol_data, nifty, regime)
-    db.record_signal_evaluations(signals, evaluated_at=now)
+    _active_scan_run.evaluated = len(symbol_data)
+    _active_scan_run.passed = len(signals)
+    _active_scan_run.model = "breakout"
+    features = {
+        sig.symbol: feature_snapshot(sig, symbol_data[sig.symbol], nifty)
+        for sig in signals
+    }
+    signal_ids = db.record_signal_evaluations(
+        signals,
+        evaluated_at=now,
+        scan_id=_active_scan_run.scan_id,
+        strategy_version=_active_scan_run.strategy_version,
+        intraday_regime=regime.value,
+        feature_json_by_symbol=features,
+    )
+    signal_id_by_object = {
+        id(sig): signal_id for sig, signal_id in zip(signals, signal_ids)
+    }
     max_orders = int(timing["max_orders_per_day"])
-    for sig in signals:
+    for index, sig in enumerate(signals):
         if db.count_paper_orders_on_date(now.date().isoformat(), intraday_only=True) >= max_orders:
             log.info("Intraday paper-order cap reached (%d).", max_orders)
+            _active_scan_run.skip("daily_cap", len(signals) - index)
             break
         if any(p.symbol == sig.symbol for p in open_positions):
+            _active_scan_run.skip("existing_position")
             continue
 
         account = db.paper_account(capital, open_positions)
@@ -163,6 +217,12 @@ def main():
             governor, sig, account, open_positions, pnl, halted, corp, now, 360, circuit_state
         )
         if not risk.passed:
+            _active_scan_run.block(risk.reason_code)
+            safe_set_signal_block_reason(
+                db.db_path,
+                signal_id_by_object.get(id(sig)),
+                risk.reason_code,
+            )
             db.record_blocked_signal(
                 sig.symbol, sig.side.value, sig.entry_price, sig.stop_price, risk.reason_code
             )
@@ -183,19 +243,24 @@ def main():
                 is_intraday=True,
             )
             open_positions.append(pos)
+            _active_scan_run.ordered += 1
             log.info("Opened intraday PAPER position: %s", sig.symbol)
+        else:
+            _active_scan_run.skip("approval")
 
     write_runtime_marker(
         "intraday_scan",
         "SUCCESS",
         f"universe={len(symbols)} data_ready={len(symbol_data)} signals={len(signals)}",
     )
+    _finish_scan(db.db_path)
 
 
 if __name__ == "__main__":
     try:
         main()
     except BaseException as exc:
+        _finish_scan(exc=exc)
         write_runtime_marker(
             "intraday_scan",
             "FAILED",

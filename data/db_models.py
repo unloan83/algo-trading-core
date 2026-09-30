@@ -244,11 +244,18 @@ class DatabaseManager:
         self,
         signals: List[Signal],
         evaluated_at: Optional[datetime] = None,
-    ) -> None:
+        *,
+        scan_id: Optional[str] = None,
+        strategy_version: Optional[str] = None,
+        intraday_regime: Optional[str] = None,
+        eod_regime: Optional[str] = None,
+        feature_json_by_symbol: Optional[Dict[str, Optional[str]]] = None,
+    ) -> List[str]:
         timestamp = now_ist_naive(evaluated_at).isoformat()
+        signal_ids = [f"evaluation_{uuid.uuid4().hex}" for _ in signals]
         rows = [
             (
-                f"evaluation_{uuid.uuid4().hex}",
+                signal_id,
                 signal.symbol,
                 signal.side.value,
                 signal.entry_price,
@@ -259,10 +266,10 @@ class DatabaseManager:
                 signal.rationale,
                 timestamp,
             )
-            for signal in signals
+            for signal_id, signal in zip(signal_ids, signals)
         ]
         if not rows:
-            return
+            return []
         with self.get_connection() as conn:
             conn.executemany(
                 """
@@ -274,6 +281,29 @@ class DatabaseManager:
                 rows,
             )
             conn.commit()
+        from data.observability import safe_update_signal_metadata, utc_iso
+
+        feature_json_by_symbol = feature_json_by_symbol or {}
+        safe_update_signal_metadata(
+            self.db_path,
+            [
+                {
+                    "signal_id": signal_id,
+                    "symbol": signal.symbol,
+                    "model_name": signal.model_name,
+                    "session_date": now_ist_naive(evaluated_at).date().isoformat(),
+                    "scan_id": scan_id,
+                    "ts_utc": utc_iso(evaluated_at),
+                    "strategy_version": strategy_version,
+                    "intraday_regime": intraday_regime,
+                    "eod_regime": eod_regime,
+                    "feature_json": feature_json_by_symbol.get(signal.symbol),
+                    "block_reason": None,
+                }
+                for signal_id, signal in zip(signal_ids, signals)
+            ],
+        )
+        return signal_ids
 
     def get_total_realized_pnl(self) -> float:
         with self.get_connection() as conn:
@@ -467,13 +497,45 @@ class DatabaseManager:
             ))
             conn.commit()
 
-    def record_regime(self, regime: str, rationale: str):
+    def record_regime(
+        self,
+        regime: str,
+        rationale: str,
+        *,
+        observed_at: Optional[datetime] = None,
+        input_asof_date: Optional[str] = None,
+        input_candle_count: Optional[int] = None,
+        input_asof_stale: Optional[bool] = None,
+        source_mode: Optional[str] = None,
+        input_symbol: Optional[str] = None,
+        input_timeframe: Optional[str] = None,
+    ):
+        timestamp = now_ist_naive(observed_at).isoformat()
         with self.get_connection() as conn:
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT INTO regime_log (regime, rationale, timestamp)
                 VALUES (?, ?, ?)
-            """, (regime, rationale, now_ist_naive().isoformat()))
+            """, (regime, rationale, timestamp))
             conn.commit()
+            regime_id = int(cursor.lastrowid)
+        from data.observability import safe_update_regime_metadata, utc_iso
+
+        safe_update_regime_metadata(
+            self.db_path,
+            regime_id,
+            {
+                "ts_utc": utc_iso(observed_at),
+                "input_asof_date": input_asof_date,
+                "input_candle_count": input_candle_count,
+                "input_asof_stale": (
+                    None if input_asof_stale is None else int(input_asof_stale)
+                ),
+                "source_mode": source_mode,
+                "input_symbol": input_symbol,
+                "input_timeframe": input_timeframe,
+            },
+        )
+        return regime_id
 
     def get_latest_regime(self, date_iso: str) -> Optional[Dict[str, Any]]:
         with self.get_connection() as conn:
