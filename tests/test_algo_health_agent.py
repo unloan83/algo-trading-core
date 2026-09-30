@@ -1,5 +1,9 @@
 import os
+import sqlite3
+import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import scripts.algo_health_agent as health_module
@@ -43,6 +47,109 @@ class TestAlgoHealthAgent(unittest.TestCase):
         self.assertEqual(res.domain, "SYSTEM_BLOCKERS")
         self.assertEqual(res.status, "BLOCKER")
         self.assertIn("Daily circuit breached", res.message)
+
+    @patch(
+        "scripts.algo_health_agent.now_ist_naive",
+        return_value=datetime(2026, 10, 1, 10, 0, 0),
+    )
+    @patch("scripts.algo_health_agent.CircuitTracker")
+    def test_check_system_blockers_reports_cooldown_as_yellow_state(
+        self,
+        mock_tracker_cls,
+        _mock_now,
+    ):
+        mock_tracker = mock_tracker_cls.return_value
+        mock_tracker.compute_mark_to_market_pnl.return_value = (0.0, 0.0, 0.0)
+        self.mock_db.paper_account.return_value = (30000.0, 30000.0)
+        self.mock_db.get_latest_circuit_state.return_value = {
+            "consecutive_losses": 5,
+            "last_loss_time": datetime(2026, 9, 30, 15, 15, 1),
+        }
+        self.mock_db.get_open_positions.return_value = []
+
+        res = self.agent.check_system_blockers()
+
+        self.assertEqual(res.status, "COOLDOWN")
+        self.assertEqual(
+            res.message,
+            "COOLDOWN until 2026-10-01 15:15:01 IST "
+            "(losses=5, net-based)",
+        )
+        self.assertTrue(res.details["net_based"])
+
+    def test_consecutive_failed_scan_services_reads_database_read_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scan_runs.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE scan_runs (
+                        mode TEXT NOT NULL,
+                        started_ts_utc TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        error_type TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO scan_runs VALUES (?, ?, ?, ?)",
+                    [
+                        ("intraday", "2026-09-30T07:00:00Z", "FAILED", "TimeoutError"),
+                        ("intraday", "2026-09-30T06:55:00Z", "FAILED", "TimeoutError"),
+                        ("intraday", "2026-09-30T06:50:00Z", "FAILED", "ConnectionError"),
+                        ("intraday", "2026-09-30T06:45:00Z", "SUCCESS", None),
+                        ("eod", "2026-09-29T10:30:00Z", "FAILED", "ValueError"),
+                    ],
+                )
+
+            self.mock_db.db_path = str(db_path)
+            streaks = self.agent._consecutive_failed_scan_services()
+
+            self.assertEqual(
+                streaks,
+                {
+                    "intraday": {
+                        "count": 3,
+                        "latest_error_type": "TimeoutError",
+                    }
+                },
+            )
+
+            with sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+            ) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0],
+                    5,
+                )
+
+    @patch(
+        "scripts.algo_health_agent.now_ist_naive",
+        return_value=datetime(2026, 9, 30, 7, 0, 0),
+    )
+    def test_three_failed_scan_services_are_notify_only_warning(
+        self,
+        _mock_now,
+    ):
+        self.mock_broker.is_nse_trading_day.return_value = True
+        streak = {
+            "intraday": {
+                "count": 3,
+                "latest_error_type": "TimeoutError",
+            }
+        }
+
+        with patch.object(
+            self.agent,
+            "_consecutive_failed_scan_services",
+            return_value=streak,
+        ):
+            res = self.agent.check_runtime_activity()
+
+        self.assertEqual(res.status, "WARNING")
+        self.assertIn("Notify-only", res.message)
+        self.assertIn("count=3", res.message)
 
     def test_check_token_blockages_missing_env(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -165,6 +272,34 @@ class TestAlgoHealthAgent(unittest.TestCase):
         "sys.argv",
         ["algo_health_agent.py", "--mode", "check"],
     )
+    def test_check_mode_cooldown_sends_alert_without_failure(
+        self,
+        mock_agent_cls,
+    ):
+        agent = mock_agent_cls.return_value
+        results = [
+            HealthCheckResult(
+                "SYSTEM_BLOCKERS",
+                "COOLDOWN",
+                "COOLDOWN until 2026-10-01 15:15:01 IST "
+                "(losses=5, net-based)",
+            ),
+        ]
+        agent.run_all_checks.return_value = results
+        agent.send_issue_alert_if_any.return_value = True
+
+        mode, exit_code = health_module.main()
+
+        self.assertEqual(mode, "check")
+        self.assertEqual(exit_code, 0)
+        agent.send_issue_alert_if_any.assert_called_once_with(results)
+        agent.send_health_heartbeat.assert_not_called()
+
+    @patch("scripts.algo_health_agent.AlgoHealthAgent")
+    @patch(
+        "sys.argv",
+        ["algo_health_agent.py", "--mode", "check"],
+    )
     def test_check_mode_blocker_sends_alert_not_heartbeat(
         self,
         mock_agent_cls,
@@ -243,6 +378,28 @@ class TestAlgoHealthAgent(unittest.TestCase):
                     )
                 ]
             )
+
+    def test_cooldown_alert_is_yellow_and_contains_expiry(self):
+        self.agent.telegram.is_configured = MagicMock(return_value=True)
+        self.agent.telegram.send_message = MagicMock(
+            return_value=(True, None, None)
+        )
+        result = HealthCheckResult(
+            "SYSTEM_BLOCKERS",
+            "COOLDOWN",
+            "COOLDOWN until 2026-10-01 15:15:01 IST "
+            "(losses=5, net-based)",
+        )
+
+        self.assertTrue(self.agent.send_issue_alert_if_any([result]))
+
+        message = self.agent.telegram.send_message.call_args.args[0]
+        self.assertIn("🟡 <b>ALGO SYSTEM — HEALTH ALERT</b>", message)
+        self.assertIn(
+            "🟡 <b>SYSTEM_BLOCKERS</b>: COOLDOWN until "
+            "2026-10-01 15:15:01 IST (losses=5, net-based)",
+            message,
+        )
 
 
 if __name__ == "__main__":

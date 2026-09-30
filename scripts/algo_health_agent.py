@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from datetime import time, timedelta
@@ -142,6 +143,7 @@ class AlgoHealthAgent:
             cooldown_cfg = cfg["consecutive_loss_cooldown"]
 
             blockers = []
+            cooldown_end = None
 
             daily_loss_pct = abs(min(daily, 0.0)) / equity * 100.0
             weekly_loss_pct = abs(min(weekly, 0.0)) / equity * 100.0
@@ -167,11 +169,6 @@ class AlgoHealthAgent:
 
             if consecutive_losses >= trigger and last_loss_time:
                 cooldown_end = last_loss_time + timedelta(hours=cooldown_hours)
-                if now < cooldown_end:
-                    blockers.append(
-                        f"Consecutive-loss cooldown active: "
-                        f"{consecutive_losses} losses"
-                    )
 
             if blockers:
                 return HealthCheckResult(
@@ -186,6 +183,24 @@ class AlgoHealthAgent:
                         "daily_circuit_used_pct": daily_loss_pct,
                         "weekly_circuit_used_pct": weekly_loss_pct,
                         "monthly_circuit_used_pct": monthly_loss_pct,
+                    },
+                )
+
+            if cooldown_end is not None and now < cooldown_end:
+                return HealthCheckResult(
+                    "SYSTEM_BLOCKERS",
+                    "COOLDOWN",
+                    "COOLDOWN until "
+                    f"{cooldown_end.strftime('%Y-%m-%d %H:%M:%S IST')} "
+                    f"(losses={consecutive_losses}, net-based)",
+                    {
+                        "daily_pnl": daily,
+                        "weekly_pnl": weekly,
+                        "monthly_pnl": monthly,
+                        "equity": equity,
+                        "cooldown_until_ist": cooldown_end.isoformat(),
+                        "consecutive_losses": consecutive_losses,
+                        "net_based": True,
                     },
                 )
 
@@ -492,12 +507,82 @@ class AlgoHealthAgent:
                 )
         return marker
 
+    def _consecutive_failed_scan_services(self) -> Dict[str, Dict]:
+        """Read scan failure streaks without opening the trading DB writable."""
+        try:
+            raw_path = getattr(self.db, "db_path", None)
+            if not isinstance(raw_path, (str, os.PathLike)):
+                return {}
+
+            db_path = Path(raw_path).expanduser().resolve()
+            if not db_path.is_absolute() or not db_path.is_file():
+                return {}
+
+            uri = f"{db_path.as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT mode, status, error_type
+                    FROM scan_runs
+                    ORDER BY started_ts_utc DESC
+                    LIMIT 100
+                    """
+                ).fetchall()
+        except sqlite3.Error as exc:
+            log.error(
+                "SCAN_FAILURE_STREAK_READ_FAILED:%s:%s",
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+        except (OSError, TypeError, ValueError) as exc:
+            log.error(
+                "SCAN_FAILURE_STREAK_PATH_FAILED:%s:%s",
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+
+        streaks: Dict[str, Dict] = {}
+        completed_modes = set()
+        for mode, status, error_type in rows:
+            if mode in completed_modes:
+                continue
+            if status == "FAILED":
+                entry = streaks.setdefault(
+                    mode,
+                    {"count": 0, "latest_error_type": error_type},
+                )
+                entry["count"] += 1
+            else:
+                completed_modes.add(mode)
+
+        return {
+            mode: entry
+            for mode, entry in streaks.items()
+            if entry["count"] >= 3
+        }
+
     def check_runtime_activity(self) -> HealthCheckResult:
         try:
             now = now_ist_naive()
             trading_day = self.broker.is_nse_trading_day(now.date())
             blockers = []
+            warnings = []
             details = {}
+
+            failed_scan_services = self._consecutive_failed_scan_services()
+            if failed_scan_services:
+                details["consecutive_failed_scan_services"] = (
+                    failed_scan_services
+                )
+                for mode, failure in sorted(failed_scan_services.items()):
+                    reason = failure.get("latest_error_type") or "UNKNOWN"
+                    warnings.append(
+                        "Notify-only: consecutive failed scan services "
+                        f"mode={mode} count={failure['count']} "
+                        f"reason={reason}"
+                    )
 
             if now.time() >= time(8, 50):
                 marker = self._require_success_today(
@@ -556,6 +641,14 @@ class AlgoHealthAgent:
                     "RUNTIME_ACTIVITY",
                     "BLOCKER",
                     "; ".join(blockers),
+                    details,
+                )
+
+            if warnings:
+                return HealthCheckResult(
+                    "RUNTIME_ACTIVITY",
+                    "WARNING",
+                    "; ".join(warnings),
                     details,
                 )
 
@@ -683,11 +776,14 @@ class AlgoHealthAgent:
 
         blockers = [r for r in results if r.status == "BLOCKER"]
         warnings = [r for r in results if r.status == "WARNING"]
+        cooldowns = [r for r in results if r.status == "COOLDOWN"]
 
         if blockers:
             overall = "🔴 BLOCKED"
         elif warnings:
             overall = "🟡 WARNING"
+        elif cooldowns:
+            overall = "🟡 COOLDOWN"
         else:
             overall = "🟢 READY"
 
@@ -714,6 +810,7 @@ class AlgoHealthAgent:
             icon = {
                 "OK": "🟢",
                 "WARNING": "🟡",
+                "COOLDOWN": "🟡",
                 "BLOCKER": "🔴",
             }[result.status]
 
@@ -741,11 +838,14 @@ class AlgoHealthAgent:
 
         blockers = [r for r in results if r.status == "BLOCKER"]
         warnings = [r for r in results if r.status == "WARNING"]
+        cooldowns = [r for r in results if r.status == "COOLDOWN"]
 
         if blockers:
             overall = "🔴 ISSUE DETECTED"
         elif warnings:
             overall = "🟡 WARNING"
+        elif cooldowns:
+            overall = "🟡 COOLDOWN"
         else:
             overall = "🟢 HEALTHY"
 
@@ -788,7 +888,7 @@ class AlgoHealthAgent:
         issues = [
             r
             for r in results
-            if r.status in ("WARNING", "BLOCKER")
+            if r.status in ("WARNING", "COOLDOWN", "BLOCKER")
         ]
 
         if not issues:
@@ -931,14 +1031,17 @@ class AlgoHealthAgent:
         issues = [
             r
             for r in results
-            if r.status in ("WARNING", "BLOCKER")
+            if r.status in ("WARNING", "COOLDOWN", "BLOCKER")
         ]
 
         if not issues:
             return True
 
+        alert_icon = (
+            "🚨" if any(r.status == "BLOCKER" for r in issues) else "🟡"
+        )
         lines = [
-            "🚨 <b>ALGO SYSTEM — HEALTH ALERT</b>",
+            f"{alert_icon} <b>ALGO SYSTEM — HEALTH ALERT</b>",
             "",
             f"• <b>Time:</b> "
             f"{now_ist_naive().strftime('%Y-%m-%d %H:%M:%S IST')}",
@@ -989,7 +1092,7 @@ def main():
     issues = [
         r
         for r in results
-        if r.status in ("WARNING", "BLOCKER")
+        if r.status in ("WARNING", "COOLDOWN", "BLOCKER")
     ]
 
     blockers = [
